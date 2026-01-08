@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+status.json
+google_key.json
+.claude/
