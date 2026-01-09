@@ -233,12 +233,10 @@ def main():
         logger.info(f"Status: {availability} (Last: {last_status})")
 
         if last_status == 'N' and availability == 'Y':
-            import urllib.parse
-            encoded_title = urllib.parse.quote(title)
-            # Bucheon Library Search URL (Example, adjust as needed)
-            search_url = f"https://library.bucheon.go.kr/library/search/page1.do?title={encoded_title}"
-            
-            message = f"📚 **Available Now!**\n\n📖 **{title}**\n📍 {lib_name}\n\n[Reserve/Check Details]({search_url})"
+            # Bucheon Library Search URL with ISBN
+            search_url = f"https://alpasq.bcl.go.kr/search/keyword/{isbn}"
+
+            message = f"📚 대출 가능!\n\n📖 {title}\n📍 {lib_name}\n\n🔗 {search_url}"
             notifier.send_message(message)
             changes_detected = True
         
