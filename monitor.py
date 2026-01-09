@@ -29,13 +29,28 @@ class ConfigManager:
 
     def get_google_creds(self):
         try:
-            # Fix for GitHub Secrets converting \n to actual newlines
-            fixed_json = self.google_creds_json.replace('\n', '\\n').replace('\r', '')
-            creds_dict = json.loads(fixed_json)
+            json_str = self.google_creds_json
+            if not json_str:
+                logger.error("GOOGLE_SHEET_CREDENTIALS is empty")
+                return None
+
+            # Try parsing as-is first (for local .env)
+            try:
+                creds_dict = json.loads(json_str)
+            except json.JSONDecodeError:
+                # Fix for GitHub Secrets converting \n to actual newlines in private_key
+                # Replace actual newlines with \\n only inside the private_key value
+                import re
+                def fix_newlines(match):
+                    return match.group(0).replace('\n', '\\n')
+                json_str = re.sub(r'"private_key"\s*:\s*"[^"]*"', fix_newlines, json_str, flags=re.DOTALL)
+                creds_dict = json.loads(json_str)
+
             scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
             return ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         except Exception as e:
             logger.error(f"Failed to parse Google Credentials: {e}")
+            logger.error(f"JSON starts with: {self.google_creds_json[:100] if self.google_creds_json else 'EMPTY'}")
             return None
 
 class LibraryClient:
