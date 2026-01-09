@@ -29,7 +29,9 @@ class ConfigManager:
 
     def get_google_creds(self):
         try:
-            creds_dict = json.loads(self.google_creds_json)
+            # Fix for GitHub Secrets converting \n to actual newlines
+            fixed_json = self.google_creds_json.replace('\n', '\\n').replace('\r', '')
+            creds_dict = json.loads(fixed_json)
             scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
             return ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         except Exception as e:
