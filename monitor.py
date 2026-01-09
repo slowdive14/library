@@ -39,12 +39,15 @@ class ConfigManager:
                 creds_dict = json.loads(json_str)
             except json.JSONDecodeError:
                 # Fix for GitHub Secrets converting \n to actual newlines in private_key
-                # Replace actual newlines with \\n only inside the private_key value
                 import re
                 def fix_newlines(match):
                     return match.group(0).replace('\n', '\\n')
                 json_str = re.sub(r'"private_key"\s*:\s*"[^"]*"', fix_newlines, json_str, flags=re.DOTALL)
                 creds_dict = json.loads(json_str)
+
+            # Ensure private_key has actual newlines (not \\n strings)
+            if 'private_key' in creds_dict:
+                creds_dict['private_key'] = creds_dict['private_key'].replace('\\n', '\n')
 
             scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
             return ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
