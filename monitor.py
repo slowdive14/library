@@ -45,9 +45,18 @@ class ConfigManager:
                 json_str = re.sub(r'"private_key"\s*:\s*"[^"]*"', fix_newlines, json_str, flags=re.DOTALL)
                 creds_dict = json.loads(json_str)
 
-            # Ensure private_key has actual newlines (not \\n strings)
+            # Normalize private_key format for RSA
             if 'private_key' in creds_dict:
-                creds_dict['private_key'] = creds_dict['private_key'].replace('\\n', '\n')
+                pk = creds_dict['private_key']
+                # Remove carriage returns
+                pk = pk.replace('\r', '')
+                # Convert literal \\n to actual newlines
+                pk = pk.replace('\\n', '\n')
+                # Ensure single newlines (no double newlines)
+                while '\n\n' in pk:
+                    pk = pk.replace('\n\n', '\n')
+                creds_dict['private_key'] = pk
+                logger.info(f"Private key starts with: {pk[:50]}")
 
             scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
             return ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
