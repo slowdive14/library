@@ -60,6 +60,15 @@ class ConfigManager:
                 pk = pk.replace('\r', '')
                 # Convert literal \\n to actual newlines
                 pk = pk.replace('\\n', '\n')
+                # Fix broken BEGIN/END markers (GitHub Secrets sometimes breaks these)
+                pk = pk.replace('-----BEGIN PRIVATE\n  KEY-----', '-----BEGIN PRIVATE KEY-----')
+                pk = pk.replace('-----END PRIVATE\n  KEY-----', '-----END PRIVATE KEY-----')
+                pk = pk.replace('-----BEGIN PRIVATE \nKEY-----', '-----BEGIN PRIVATE KEY-----')
+                pk = pk.replace('-----END PRIVATE \nKEY-----', '-----END PRIVATE KEY-----')
+                # More generic fix - remove any whitespace issues in markers
+                import re
+                pk = re.sub(r'-----BEGIN\s+PRIVATE\s+KEY-----', '-----BEGIN PRIVATE KEY-----', pk)
+                pk = re.sub(r'-----END\s+PRIVATE\s+KEY-----', '-----END PRIVATE KEY-----', pk)
                 # Ensure single newlines (no double newlines)
                 while '\n\n' in pk:
                     pk = pk.replace('\n\n', '\n')
