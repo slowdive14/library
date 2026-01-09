@@ -45,22 +45,23 @@ class LibraryClient:
 
     def search_book_isbn(self, title):
         """Searches for a book by title and returns the ISBN13 of the first result."""
-        params = {
-            'authKey': self.api_key,
-            'title': title,
-            'format': 'json',
-            'pageSize': 1
-        }
-        try:
-            response = requests.get(f"{self.BASE_URL}/bookSearch", params=params)
-            response.raise_for_status()
-            data = response.json()
-            if data.get('response', {}).get('docs'):
-                return data['response']['docs'][0]['doc']['isbn13']
-            return None
-        except Exception as e:
-            logger.error(f"Error searching for book '{title}': {e}")
-            return None
+        # Try with original title first, then without spaces
+        for search_title in [title, title.replace(' ', '')]:
+            params = {
+                'authKey': self.api_key,
+                'title': search_title,
+                'format': 'json',
+                'pageSize': 1
+            }
+            try:
+                response = requests.get(f"{self.BASE_URL}/srchBooks", params=params)
+                response.raise_for_status()
+                data = response.json()
+                if data.get('response', {}).get('docs'):
+                    return data['response']['docs'][0]['doc']['isbn13']
+            except Exception as e:
+                logger.error(f"Error searching for book '{search_title}': {e}")
+        return None
 
     def check_availability(self, lib_code, isbn13):
         """Checks if a book is available at a specific library."""
