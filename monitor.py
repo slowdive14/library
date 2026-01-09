@@ -34,20 +34,28 @@ class ConfigManager:
                 logger.error("GOOGLE_SHEET_CREDENTIALS is empty")
                 return None
 
+            logger.info(f"JSON length: {len(json_str)}")
+
             # Try parsing as-is first (for local .env)
             try:
                 creds_dict = json.loads(json_str)
-            except json.JSONDecodeError:
+                logger.info("JSON parsed successfully (first try)")
+            except json.JSONDecodeError as e:
+                logger.info(f"First JSON parse failed: {e}, trying fix...")
                 # Fix for GitHub Secrets converting \n to actual newlines in private_key
                 import re
                 def fix_newlines(match):
                     return match.group(0).replace('\n', '\\n')
                 json_str = re.sub(r'"private_key"\s*:\s*"[^"]*"', fix_newlines, json_str, flags=re.DOTALL)
                 creds_dict = json.loads(json_str)
+                logger.info("JSON parsed successfully (after fix)")
+
+            logger.info(f"Keys in creds_dict: {list(creds_dict.keys())}")
 
             # Normalize private_key format for RSA
             if 'private_key' in creds_dict:
                 pk = creds_dict['private_key']
+                logger.info(f"Original private_key length: {len(pk)}")
                 # Remove carriage returns
                 pk = pk.replace('\r', '')
                 # Convert literal \\n to actual newlines
@@ -56,10 +64,14 @@ class ConfigManager:
                 while '\n\n' in pk:
                     pk = pk.replace('\n\n', '\n')
                 creds_dict['private_key'] = pk
-                logger.info(f"Private key starts with: {pk[:50]}")
+                logger.info(f"Private key starts with: {pk[:60]}")
+                logger.info(f"Private key ends with: {pk[-40:]}")
 
             scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-            return ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+            logger.info("About to create credentials...")
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+            logger.info("Credentials created successfully!")
+            return creds
         except Exception as e:
             logger.error(f"Failed to parse Google Credentials: {e}")
             logger.error(f"JSON starts with: {self.google_creds_json[:100] if self.google_creds_json else 'EMPTY'}")
