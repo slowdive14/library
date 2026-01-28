@@ -2,7 +2,7 @@ name: Bucheon Library Monitor
 
 on:
   schedule:
-    - cron: '0 * * * *' # Every hour
+    - cron: '*/15 * * * *' # Every 15 minutes
   workflow_dispatch: # Allow manual trigger
 
 jobs:
