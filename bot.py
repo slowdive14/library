@@ -8,6 +8,8 @@ from oauth2client.service_account import ServiceAccountCredentials
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+import http.server
+import threading
 
 # Load environment variables
 load_dotenv()
@@ -46,8 +48,6 @@ BUCHEON_LIBRARIES = {
 DEFAULT_LIB_CODE = "141652"
 DEFAULT_LIB_NAME = "별빛마루도서관"
 
-# Monitoring configuration
-MONITOR_INTERVAL_MINUTES = 30  # Check every 30 minutes
 STATUS_FILE = "status.json"
 
 class LibraryClient:
@@ -175,9 +175,28 @@ class StateManager:
             logger.error(f"Failed to save state: {e}")
 
 
-# Initialize clients
-lib_client = LibraryClient(LIBRARY_API_KEY)
-sheet_manager = SheetManager()
+# Global clients (initialized in main)
+lib_client = None
+sheet_manager = None
+
+
+def start_health_server():
+    """Starts a dummy HTTP server for Render health checks."""
+    port = int(os.environ.get("PORT", 8443))
+
+    class HealthCheckHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        def log_message(self, format, *args):
+            return  # Disable logging for health checks
+
+    server = http.server.HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    logger.info(f"Health check server started on port {port}")
+    server.serve_forever()
 
 
 async def send_telegram_notification(application: Application, message: str):
@@ -189,75 +208,7 @@ async def send_telegram_notification(application: Application, message: str):
         logger.error(f"Failed to send Telegram message: {e}")
 
 
-async def background_monitor(application: Application):
-    """Background task that monitors book availability."""
-    logger.info("Background monitor started")
 
-    while True:
-        try:
-            await asyncio.sleep(MONITOR_INTERVAL_MINUTES * 60)  # Wait first, then check
-
-            logger.info("Running scheduled availability check...")
-            books = sheet_manager.get_all_books()
-
-            if not books:
-                logger.info("No books to monitor")
-                continue
-
-            state = StateManager.load_state()
-            new_state = state.copy()
-
-            for row in books:
-                title = row.get('Title')
-                lib_code = str(row.get('LibraryCode', DEFAULT_LIB_CODE))
-                lib_name = row.get('LibraryName', DEFAULT_LIB_NAME)
-                isbn = row.get('ISBN')
-
-                if not title:
-                    continue
-
-                # Get ISBN if not provided
-                if not isbn:
-                    search_result = lib_client.search_book(title)
-                    if search_result:
-                        isbn = search_result[0]['doc'].get('isbn13', '')
-
-                if not isbn:
-                    logger.warning(f"Could not find ISBN for '{title}'")
-                    continue
-
-                # Check availability
-                availability = lib_client.check_availability(lib_code, isbn)
-                if not availability:
-                    continue
-
-                loan_available = availability.get('loanAvailable', 'N')
-                key = f"{isbn}_{lib_code}"
-                last_status = state.get(key, 'N')
-
-                logger.info(f"{title}: {loan_available} (was: {last_status})")
-
-                # Notify if newly available
-                if last_status == 'N' and loan_available == 'Y':
-                    search_url = f"https://alpasq.bcl.go.kr/search/keyword/{isbn}"
-                    message = f"📚 대출 가능!\n\n📖 {title}\n📍 {lib_name}\n\n🔗 {search_url}"
-                    await send_telegram_notification(application, message)
-
-                new_state[key] = loan_available
-
-                # Rate limit
-                await asyncio.sleep(0.5)
-
-            if new_state != state:
-                StateManager.save_state(new_state)
-                logger.info("State updated")
-
-        except asyncio.CancelledError:
-            logger.info("Background monitor cancelled")
-            break
-        except Exception as e:
-            logger.error(f"Error in background monitor: {e}")
-            await asyncio.sleep(60)  # Wait a minute before retrying
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -467,21 +418,38 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ '{title}'을(를) 찾을 수 없습니다.")
 
 
-async def post_init(application: Application):
-    """Called after the application is initialized."""
-    # Start background monitor
-    asyncio.create_task(background_monitor(application))
-    logger.info("Background monitor task created")
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle plain text messages as book search."""
+    text = update.message.text.strip()
+    if not text:
+        return
+
+    # Treat plain text as a book search
+    context.args = text.split()
+    await cmd_search(update, context)
 
 
 def main():
     """Start the bot."""
+    global lib_client, sheet_manager
     logger.info("Starting Telegram Bot...")
 
-    # Create the Application
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+    # Start health server in background for Render
+    if os.environ.get('RENDER'):
+        threading.Thread(target=start_health_server, daemon=True).start()
 
-    # Add command handlers (English only - Telegram limitation)
+    # Initialize clients safely
+    try:
+        lib_client = LibraryClient(LIBRARY_API_KEY)
+        sheet_manager = SheetManager()
+    except Exception as e:
+        logger.error(f"Critical error during initialization: {e}")
+        # Don't exit yet, so Render doesn't loop crash, but bot won't work correctly
+
+    # Create the Application
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Add command handlers
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("h", cmd_help))
     application.add_handler(CommandHandler("search", cmd_search))
@@ -499,9 +467,12 @@ def main():
     # Handle /isbn{number} commands
     application.add_handler(MessageHandler(filters.Regex(r'^/isbn\d{13}$'), cmd_isbn))
 
-    logger.info("Bot is running with background monitoring. Press Ctrl+C to stop.")
+    # Handle plain text as book search (must be last)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
 
-    # Run the bot
+    # Run the bot (always use Polling for simplicity with health server)
+    # Render Free Tier supports both, but Polling + Health Server is more robust for Python
+    logger.info("Running in polling mode with background health check")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
