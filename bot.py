@@ -476,11 +476,11 @@ def main():
     global lib_client, sheet_manager
     logger.info("Starting Telegram Bot...")
 
-    # Start health server in background for Render immediately
-    # This helps Render detect the service as healthy as soon as possible
-    if os.environ.get('RENDER') or os.environ.get('PORT'):
+    # Start health server in background for Render ONLY if using Polling
+    # If RENDER_EXTERNAL_URL is present, we'll use run_webhook which binds to the port itself
+    if (os.environ.get('RENDER') or os.environ.get('PORT')) and not os.environ.get('RENDER_EXTERNAL_URL'):
         threading.Thread(target=start_health_server, daemon=True).start()
-        logger.info("Background health check server thread started")
+        logger.info("Background health check server thread started (Polling mode fallback)")
 
     # Initialize clients safely
     try:
@@ -514,10 +514,29 @@ def main():
     # Handle plain text as book search (must be last)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
 
-    # Run the bot (always use Polling for simplicity with health server)
-    # Render Free Tier supports both, but Polling + Health Server is more robust for Python
-    logger.info("Running in polling mode with background health check")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Run the bot
+    render_url = os.environ.get('RENDER_EXTERNAL_URL')
+    port = int(os.environ.get("PORT", 8443))
+
+    if render_url:
+        # Webhook mode for Render (to prevent spin-down)
+        logger.info(f"Running in webhook mode on port {port}")
+        logger.info(f"External URL: {render_url}")
+        
+        # Webhook URL must be HTTPS
+        webhook_url = f"{render_url}/{TELEGRAM_BOT_TOKEN}"
+        
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=TELEGRAM_BOT_TOKEN,
+            webhook_url=webhook_url,
+            allowed_updates=Update.ALL_TYPES
+        )
+    else:
+        # Polling mode for local development
+        logger.info("Running in polling mode")
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
