@@ -68,7 +68,7 @@ class LibraryClient:
                 'pageSize': 5
             }
             try:
-                response = requests.get(f"{self.BASE_URL}/srchBooks", params=params)
+                response = requests.get(f"{self.BASE_URL}/srchBooks", params=params, timeout=10)
                 response.raise_for_status()
                 data = response.json()
                 if data.get('response', {}).get('docs'):
@@ -86,7 +86,7 @@ class LibraryClient:
             'format': 'json'
         }
         try:
-            response = requests.get(f"{self.BASE_URL}/bookExist", params=params)
+            response = requests.get(f"{self.BASE_URL}/bookExist", params=params, timeout=10)
             response.raise_for_status()
             data = response.json()
             if 'response' in data and 'result' in data['response']:
@@ -109,11 +109,33 @@ class SheetManager:
 
     def _connect(self):
         try:
-            creds_dict = json.loads(GOOGLE_SHEET_CREDENTIALS)
+            json_str = GOOGLE_SHEET_CREDENTIALS
+            if not json_str:
+                logger.error("GOOGLE_SHEET_CREDENTIALS is empty")
+                return
+
+            # Robust JSON parsing (handles potential newline issues from environment variables/secrets)
+            try:
+                creds_dict = json.loads(json_str)
+            except json.JSONDecodeError:
+                # Fix for common formatting issues in private_key
+                import re
+                def fix_newlines(match):
+                    return match.group(0).replace('\n', '\\n')
+                json_str = re.sub(r'"private_key"\s*:\s*"[^"]*"', fix_newlines, json_str, flags=re.DOTALL)
+                creds_dict = json.loads(json_str)
+
+            # Normalize private_key format
+            if 'private_key' in creds_dict:
+                pk = creds_dict['private_key']
+                pk = pk.replace('\\n', '\n')
+                creds_dict['private_key'] = pk
+
             scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
             creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
             client = gspread.authorize(creds)
             self.sheet = client.open_by_url(GOOGLE_SHEET_URL).sheet1
+            logger.info("Successfully connected to Google Sheets")
         except Exception as e:
             logger.error(f"Failed to connect to Google Sheet: {e}")
 
@@ -194,9 +216,13 @@ def start_health_server():
         def log_message(self, format, *args):
             return  # Disable logging for health checks
 
-    server = http.server.HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    logger.info(f"Health check server started on port {port}")
-    server.serve_forever()
+    try:
+        server = http.server.HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+        logger.info(f"Health check server started on port {port}")
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"Failed to start health check server on port {port}: {e}")
+        # In Render, failing the port bind is fatal, but we log it for debugging
 
 
 async def send_telegram_notification(application: Application, message: str):
@@ -234,6 +260,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     query = ' '.join(context.args)
+    logger.info(f"Command /s received with query: {query}")
 
     # Check if query is ISBN (13 digits)
     if query.replace('-', '').isdigit() and len(query.replace('-', '')) == 13:
@@ -241,12 +268,19 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await check_book_by_isbn(update, isbn, f"ISBN {isbn}")
         return
 
-    await update.message.reply_text(f"🔍 '{query}' 검색 중...")
+    # Immediate feedback
+    status_msg = await update.message.reply_text(f"🔍 '{query}' 검색 중...")
 
     # Search for the book
-    books = lib_client.search_book(query)
+    try:
+        books = lib_client.search_book(query)
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        await status_msg.edit_text(f"❌ 검색 중 오류가 발생했습니다: {e}")
+        return
+
     if not books:
-        await update.message.reply_text(f"❌ '{query}' 검색 결과가 없습니다.")
+        await status_msg.edit_text(f"❌ '{query}' 검색 결과가 없습니다.")
         return
 
     # If only 1 result or user wants first, check directly
@@ -266,7 +300,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response += f"{i}. {title}\n   👤 {author}\n   /isbn{isbn}\n\n"
 
     response += "👆 원하는 책의 /isbn... 클릭"
-    await update.message.reply_text(response)
+    await status_msg.edit_text(response)
 
 
 async def check_book_by_isbn(update: Update, isbn: str, title: str = "", author: str = ""):
@@ -323,6 +357,7 @@ async def cmd_isbn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Check status of all monitored books."""
+    logger.info("Command /st received")
     books = sheet_manager.get_all_books()
 
     if not books:
@@ -386,22 +421,28 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Add a book to monitoring list."""
+    logger.info("Command /a received")
     if not context.args:
         await update.message.reply_text("사용법: /추가 책제목")
         return
 
     title = ' '.join(context.args)
+    status_msg = await update.message.reply_text(f"📝 '{title}' 모니터링 추가 중...")
 
     # Search for ISBN
-    books = lib_client.search_book(title)
-    isbn = ""
-    if books:
-        isbn = books[0]['doc'].get('isbn13', '')
+    try:
+        books = lib_client.search_book(title)
+        isbn = ""
+        if books:
+            isbn = books[0]['doc'].get('isbn13', '')
 
-    if sheet_manager.add_book(title, isbn=isbn):
-        await update.message.reply_text(f"✅ '{title}' 모니터링 목록에 추가했습니다.")
-    else:
-        await update.message.reply_text(f"❌ 추가 실패. 다시 시도해주세요.")
+        if sheet_manager.add_book(title, isbn=isbn):
+            await status_msg.edit_text(f"✅ '{title}' 모니터링 목록에 추가했습니다.")
+        else:
+            await status_msg.edit_text(f"❌ 추가 실패. 브라우저에서 직접 시트에 추가하거나 나중에 다시 시도해주세요.")
+    except Exception as e:
+        logger.error(f"Add error: {e}")
+        await status_msg.edit_text(f"❌ 처리 중 오류가 발생했습니다: {e}")
 
 
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -421,6 +462,7 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle plain text messages as book search."""
     text = update.message.text.strip()
+    logger.info(f"Received plain text message: {text}")
     if not text:
         return
 
@@ -434,9 +476,11 @@ def main():
     global lib_client, sheet_manager
     logger.info("Starting Telegram Bot...")
 
-    # Start health server in background for Render
-    if os.environ.get('RENDER'):
+    # Start health server in background for Render immediately
+    # This helps Render detect the service as healthy as soon as possible
+    if os.environ.get('RENDER') or os.environ.get('PORT'):
         threading.Thread(target=start_health_server, daemon=True).start()
+        logger.info("Background health check server thread started")
 
     # Initialize clients safely
     try:
