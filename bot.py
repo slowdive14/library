@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import json
 import logging
@@ -70,6 +71,15 @@ STATUS_HEADER = "Status"
 
 # Warn on Telegram after this many monitor passes in a row where every lookup failed
 FAILED_PASSES_BEFORE_WARNING = 3
+
+# /s search: copies fetched from the catalog (one entry per copy, so common
+# titles need a few hundred) and distinct books listed in the reply
+SEARCH_COPIES = 300
+MAX_SEARCH_RESULTS = 30
+TELEGRAM_MESSAGE_LIMIT = 4096
+
+# ISBN-13, or ISBN-10 (older books in the catalog, check digit may be X)
+ISBN_PATTERN = r'\d{13}|\d{9}[\dX]'
 
 
 class SheetManager:
@@ -312,16 +322,16 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = ' '.join(context.args)
     logger.info(f"Command /s received with query: {query}")
 
-    # Check if query is ISBN (13 digits)
-    if query.replace('-', '').isdigit() and len(query.replace('-', '')) == 13:
-        isbn = query.replace('-', '')
+    # Check if query is an ISBN
+    isbn = query.replace('-', '').upper()
+    if re.fullmatch(ISBN_PATTERN, isbn):
         await check_book_by_isbn(update, isbn)
         return
 
     # Immediate feedback
     status_msg = await update.message.reply_text(f"🔍 '{query}' 검색 중...")
 
-    copies = await asyncio.to_thread(lib_client.search, query, None, "SCORE")
+    copies = await asyncio.to_thread(lib_client.search, query, None, "SCORE", SEARCH_COPIES)
     if copies is None:
         await status_msg.edit_text("❌ 도서관 검색 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
         return
@@ -330,7 +340,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     books = {}
     for copy in copies:
         if copy['isbn']:
-            books.setdefault(copy['isbn'], copy)
+            books.setdefault(copy['isbn'], []).append(copy)
 
     if not books:
         await status_msg.edit_text(f"❌ '{query}' 검색 결과가 없습니다. (부천시 도서관 미소장)")
@@ -342,14 +352,47 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Show multiple results for user to choose
-    response = f"📚 '{query}' 검색 결과 ({len(books)}건)\n\n"
-    for i, book in enumerate(list(books.values())[:5], 1):
-        title = book['title'][:40]
-        author = book['author'][:20]
-        response += f"{i}. {title}\n   👤 {author}\n   /isbn{book['isbn']}\n\n"
+    blocks = [f"📚 '{query}' 검색 결과 ({len(books)}건)"]
+    for i, book_copies in enumerate(list(books.values())[:MAX_SEARCH_RESULTS], 1):
+        book = book_copies[0]
+        blocks.append(
+            f"{i}. {book['title'][:40]}\n   👤 {book['author'][:20]}\n"
+            f"   {summarize_libraries(book_copies)}\n   /isbn{book['isbn']}"
+        )
 
-    response += "👆 원하는 책의 /isbn... 클릭"
-    await status_msg.edit_text(response)
+    footer = "👆 원하는 책의 /isbn... 클릭"
+    if len(books) > MAX_SEARCH_RESULTS:
+        footer = (f"… 외 {len(books) - MAX_SEARCH_RESULTS}건은 생략했습니다. "
+                  f"제목을 더 구체적으로 입력해 주세요.\n\n{footer}")
+    blocks.append(footer)
+
+    messages = split_message(blocks)
+    await status_msg.edit_text(messages[0])
+    for message in messages[1:]:
+        await update.message.reply_text(message)
+
+
+def summarize_libraries(copies):
+    """Summarizes one book's copies across libraries, e.g. '✅ 대출가능 3곳 / 소장 7곳'."""
+    holding = {c['libCode'] for c in copies}
+    available = {c['libCode'] for c in copies if is_available([c])}
+    if available:
+        return f"✅ 대출가능 {len(available)}곳 / 소장 {len(holding)}곳"
+    return f"❌ 대출가능 없음 / 소장 {len(holding)}곳"
+
+
+def split_message(blocks, limit=TELEGRAM_MESSAGE_LIMIT):
+    """Joins blocks with blank lines into as few messages as fit Telegram's length limit."""
+    messages, current = [], ""
+    for block in blocks:
+        candidate = f"{current}\n\n{block}" if current else block
+        if current and len(candidate) > limit:
+            messages.append(current)
+            current = block
+        else:
+            current = candidate
+    messages.append(current)
+    return messages
 
 
 async def check_book_by_isbn(update: Update, isbn: str):
@@ -404,10 +447,10 @@ async def check_book_by_isbn(update: Update, isbn: str):
 async def cmd_isbn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /isbn{number} commands."""
     text = update.message.text
-    # Extract ISBN from command like /isbn9788931039560
+    # Extract ISBN from command like /isbn9788931039560 or /isbn898371154X
     if text.startswith('/isbn'):
-        isbn = text[5:].strip()
-        if isbn and len(isbn) == 13 and isbn.isdigit():
+        isbn = text[5:].strip().upper()
+        if re.fullmatch(ISBN_PATTERN, isbn):
             await check_book_by_isbn(update, isbn)
         else:
             await update.message.reply_text("잘못된 ISBN입니다.")
@@ -564,7 +607,7 @@ def main():
     application.add_handler(CommandHandler("start", cmd_help))
 
     # Handle /isbn{number} commands
-    application.add_handler(MessageHandler(filters.Regex(r'^/isbn\d{13}$'), cmd_isbn))
+    application.add_handler(MessageHandler(filters.Regex(rf'(?i)^/isbn({ISBN_PATTERN})$'), cmd_isbn))
 
     # Handle plain text as book search (must be last)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
