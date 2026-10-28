@@ -20,7 +20,7 @@ Loan status comes from the Bucheon library catalog (`alpasq.bcl.go.kr`), the sam
 4. **Share** the sheet with the `client_email` from your Google Service Account (see below) giving it **Editor** access.
 
 ### 2. Environment Variables
-Set these in a `.env` file (copied to the server in step 4).
+Set these in a `.env` file in the project folder (on a VM, copy it there as described in section 5).
 
 | Name | Description | How to get it |
 | --- | --- | --- |
@@ -29,7 +29,8 @@ Set these in a `.env` file (copied to the server in step 4).
 | `GOOGLE_SHEET_CREDENTIALS` | Service Account JSON | Google Cloud Console -> IAM & Admin -> Service Accounts -> Create Key (JSON). **Copy the entire JSON content.** |
 | `GOOGLE_SHEET_URL` | Full URL of your Sheet | Copy from browser address bar. |
 | `MONITOR_INTERVAL_MINUTES` | Optional, default `5` | Minutes between availability checks. |
-| `USE_WEBHOOK` | Optional | `true` uses webhook mode on hosts that set `RENDER_EXTERNAL_URL`. Not needed on a VM. |
+| `USE_WEBHOOK` | Optional | `true` uses webhook mode on hosts that set `RENDER_EXTERNAL_URL`. Not needed on a PC or VM. |
+| `LOG_FILE` | Optional | Also write the log to this file (rotated at 5 MB). Defaults to `bot.log` when run with `pythonw`. |
 
 ### 3. Running Locally (Testing)
 1. Install dependencies:
@@ -41,9 +42,31 @@ Set these in a `.env` file (copied to the server in step 4).
     ```bash
     python bot.py
     ```
-    ⚠️ Stop the bot on the server first (`sudo systemctl stop library-bot`). Only one bot instance can poll Telegram at a time, and starting polling removes the webhook if one is set.
+    ⚠️ Stop any other running instance first (Windows task: `Disable-ScheduledTask -TaskName LibraryBot; Stop-ScheduledTask -TaskName LibraryBot`, VM: `sudo systemctl stop library-bot`). Only one bot instance can poll Telegram at a time, and starting polling removes the webhook if one is set.
 
-### 4. Deployment: Azure VM in Korea Central
+### 4. Running 24/7 on a Windows PC (free)
+A PC on a Korean home internet line can reach the catalog. Task Scheduler keeps the bot running in the background, with no console window, while you are signed in.
+
+1. Put your `.env` in the project folder.
+2. **Stop any other running instance** of the bot (e.g. suspend the old Render service). Two instances polling the same token keep failing with `Conflict` errors.
+3. **Register the task** in the project folder (no admin needed). It creates `.venv` if missing, registers the `LibraryBot` task and starts it:
+    ```powershell
+    powershell -ExecutionPolicy Bypass -File deploy\windows\install-task.ps1
+    ```
+4. **Keep the PC awake**: Settings → System → Power → set sleep to **Never** when plugged in. Locking the screen is fine.
+5. To come back after Windows Update restarts without you signing in, turn on Settings → Accounts → Sign-in options → **Use my sign-in info to automatically finish setting up after an update**.
+
+The task fires every 5 minutes and is ignored while the bot runs, so the bot comes back within 5 minutes after sign-in, a crash or a startup without network.
+
+| Task | Command (PowerShell, project folder) |
+| --- | --- |
+| Follow the log | `Get-Content bot.log -Wait -Tail 20 -Encoding UTF8` |
+| Restart (e.g. after `git pull`) | `Stop-ScheduledTask -TaskName LibraryBot; Start-ScheduledTask -TaskName LibraryBot` |
+| Update dependencies | `.venv\Scripts\python -m pip install -r requirements.txt` |
+| Stop for good | `Disable-ScheduledTask -TaskName LibraryBot; Stop-ScheduledTask -TaskName LibraryBot` |
+| Resume | `Enable-ScheduledTask -TaskName LibraryBot; Start-ScheduledTask -TaskName LibraryBot` |
+
+### 5. Alternative: Azure VM in Korea Central
 The bot runs as a systemd service on an Ubuntu VM, polls Telegram and checks every monitored book every `MONITOR_INTERVAL_MINUTES` minutes. It needs no inbound ports besides SSH. Any Ubuntu VM with a Korean IP works the same way (e.g. Oracle Cloud with home region Chuncheon/Seoul; Tokyo, Osaka and Singapore are blocked).
 
 1. **Create an [Azure free account](https://azure.microsoft.com/pricing/purchase-options/azure-account)**. For 12 months it includes 750 hours/month each of `B1s`, `B2pts v2` and `B2ats v2` VMs, enough for one VM running all month.
@@ -87,6 +110,7 @@ Costs to watch:
 ## 📂 Project Structure
 - `bot.py`: Telegram commands and the periodic availability monitor.
 - `bucheon_library.py`: Client for the Bucheon library catalog (real-time loan status).
+- `deploy/windows/`: Task Scheduler setup for a Windows PC.
 - `deploy/`: systemd unit and setup script for an Ubuntu VM in Korea.
 - `logic.md`: When a notification is sent.
 - `requirements.txt`: Python dependencies.

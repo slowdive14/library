@@ -3,3 +3,5 @@ __pycache__/
 .env
 google_key.json
 .claude/
+.venv/
+bot.log*

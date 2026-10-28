@@ -1,6 +1,8 @@
 import os
+import sys
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import time
 import gspread
 import asyncio
@@ -15,8 +17,19 @@ from bucheon_library import BucheonLibraryClient, SEARCH_PAGE_URL, describe_hold
 # Load environment variables
 load_dotenv()
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Configure logging. LOG_FILE also writes the log to a rotating file; under
+# pythonw (e.g. Task Scheduler) there is no console, so it defaults to bot.log.
+LOG_FILE = os.getenv("LOG_FILE")
+running_windowless = sys.stderr is None or os.path.basename(sys.executable).lower() == "pythonw.exe"
+if not LOG_FILE and running_windowless:
+    LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log")
+log_handlers = []
+if sys.stderr is not None:
+    log_handlers.append(logging.StreamHandler())
+if LOG_FILE:
+    log_handlers.append(RotatingFileHandler(LOG_FILE, maxBytes=5_000_000, backupCount=1, encoding='utf-8'))
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
+                    handlers=log_handlers or None)
 # httpx logs every Telegram API request URL at INFO, and that URL contains the bot token
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
@@ -590,4 +603,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        # Without a console the traceback would be lost; Task Scheduler restarts the bot
+        logger.exception("Bot stopped by an unhandled error")
+        raise
