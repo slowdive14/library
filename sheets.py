@@ -14,7 +14,10 @@ STATUS_HEADER = "Status"
 
 # Extra tabs, created on first use
 SETTINGS_SHEET = "Settings"            # Key | Value (e.g. home_libraries)
-SUBSCRIPTIONS_SHEET = "Subscriptions"  # Query | Seen (ISBNs already announced)
+# Query | Seen | ISBN. Keyword subscriptions keep the ISBNs already announced in
+# Seen; ISBN subscriptions (one exact book) keep the libraries already holding it.
+SUBSCRIPTIONS_SHEET = "Subscriptions"
+SUBSCRIPTION_HEADERS = ["Query", "Seen", "ISBN"]
 
 
 def short_key(*parts):
@@ -33,6 +36,7 @@ class SheetManager:
         self.spreadsheet = None
         self.sheet = None
         self._settings = None
+        self._subscription_headers_checked = False
         self._connect(credentials_json, sheet_url)
 
     def _connect(self, credentials_json, sheet_url):
@@ -180,23 +184,37 @@ class SheetManager:
             logger.error(f"Error saving setting {key}: {e}")
             return False
 
+    def _subscriptions_sheet(self):
+        ws = self._worksheet(SUBSCRIPTIONS_SHEET, SUBSCRIPTION_HEADERS)
+        if not getattr(self, '_subscription_headers_checked', False):
+            # Tabs created before ISBN subscriptions existed lack the ISBN column
+            headers = ws.row_values(1)
+            for name in SUBSCRIPTION_HEADERS:
+                if name not in headers:
+                    headers.append(name)
+                    if len(headers) > ws.col_count:
+                        ws.add_cols(len(headers) - ws.col_count)
+                    ws.update_cell(1, len(headers), name)
+            self._subscription_headers_checked = True
+        return ws
+
     def get_subscriptions(self):
-        """Returns [{'Query': str, 'Seen': set of ISBNs}] for new-arrival alerts."""
+        """Returns [{'Query': str, 'Seen': set, 'ISBN': str}] for new-arrival alerts."""
         if not self.spreadsheet:
             return []
         try:
-            rows = self._worksheet(SUBSCRIPTIONS_SHEET, ["Query", "Seen"]).get_all_records()
+            rows = self._subscriptions_sheet().get_all_records()
         except Exception as e:
             logger.error(f"Error reading subscriptions: {e}")
             return []
-        return [{'Query': str(r['Query']), 'Seen': {s for s in str(r['Seen']).split(',') if s}}
+        return [{'Query': str(r['Query']), 'Seen': {s for s in str(r['Seen']).split(',') if s},
+                 'ISBN': str(r.get('ISBN', '')).strip()}
                 for r in rows if str(r.get('Query', '')).strip()]
 
-    def save_subscription(self, query, seen):
-        """Adds a subscription or replaces its seen ISBNs."""
+    def save_subscription(self, query, seen, isbn=""):
+        """Adds a subscription or replaces its seen set."""
         try:
-            ws = self._worksheet(SUBSCRIPTIONS_SHEET, ["Query", "Seen"])
-            self._replace_row(ws, query, [query, ",".join(sorted(seen))])
+            self._replace_row(self._subscriptions_sheet(), query, [query, ",".join(sorted(seen)), isbn])
             return True
         except Exception as e:
             logger.error(f"Error saving subscription '{query}': {e}")
@@ -205,7 +223,7 @@ class SheetManager:
     def delete_subscription(self, key):
         """Deletes the subscription whose short_key(query) matches; returns its query, or None."""
         try:
-            ws = self._worksheet(SUBSCRIPTIONS_SHEET, ["Query", "Seen"])
+            ws = self._subscriptions_sheet()
             for i, query in enumerate(ws.col_values(1)[1:], start=2):
                 if short_key(query) == key:
                     ws.delete_rows(i)

@@ -336,10 +336,34 @@ def book_buttons(isbn):
     ]])
 
 
+def format_isbn_arrival(copies, new_codes, first_arrival):
+    """Alert for an ISBN subscription: the book reached Bucheon, or more libraries."""
+    book = copies[0]
+    head = "🆕 기다리던 책이 부천 도서관에 들어왔어요!" if first_arrival else "🆕 다른 도서관에도 새로 들어왔어요"
+    arrived = group_by_library([c for c in copies if c['libCode'] in new_codes], home_libraries())
+    lines = [library_line(code, cs) for code, cs in arrived.items()]
+    if len(lines) > 5:
+        lines = lines[:5] + [f"… 외 {len(lines) - 5}곳"]
+    return f"{head}\n\n📖 {book['title']}\n👤 {book['author']}\n\n" + "\n".join(lines)
+
+
 def run_new_arrival_pass():
     """Returns [(text, isbn or None)] for books new since the last check (blocking)."""
     alerts = []
     for sub in sheet_manager.get_subscriptions():
+        if sub['ISBN']:
+            # One exact book: Seen holds the libraries that already have it
+            copies = find_isbn_copies(sub['ISBN'])
+            if copies is None:
+                continue
+            holding = {c['libCode'] for c in copies}
+            new_codes = holding - sub['Seen']
+            if new_codes:
+                alerts.append((format_isbn_arrival(copies, new_codes, not sub['Seen']), sub['ISBN']))
+                sheet_manager.save_subscription(sub['Query'], sub['Seen'] | holding, sub['ISBN'])
+            time.sleep(1)
+            continue
+
         books = find_matching_books(sub['Query'])
         if books is None:
             continue
@@ -374,7 +398,7 @@ BOT_COMMANDS = [
     BotCommand("st", "알림 걸어 둔 책 상태"),
     BotCommand("l", "알림 목록 · 삭제"),
     BotCommand("a", "제목으로 알림 추가"),
-    BotCommand("new", "저자·키워드 신착 알림"),
+    BotCommand("new", "신착 알림 (저자·키워드·ISBN)"),
     BotCommand("home", "내 도서관 설정"),
     BotCommand("h", "도움말"),
 ]
@@ -402,6 +426,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /a 책제목 - 제목으로 알림 추가
 /d 번호 또는 책제목 - 알림 삭제
 /new 저자나 키워드 - 신착 알림 (/new 만 쓰면 목록)
+/new ISBN (또는 /new 제목 ISBN) - 그 책만 정확히 신착 알림
 /home - 내 도서관 설정
 /h - 이 도움말
 
@@ -554,10 +579,30 @@ def library_line(code, lib_copies):
     return f"❌ {short_name(code, lib_copies[0]['libName'])} · {detail}"
 
 
+def library_status_lines(holdings, home, limit=4):
+    """Per-library lines for /st: where the book can be borrowed now (내 도서관 first),
+    or, when every copy is out, each library by earliest return date."""
+    by_library = group_by_library(holdings, home)
+    available = [(code, cs) for code, cs in by_library.items() if is_available(cs)]
+    if available:
+        ordered = available
+    else:
+        def earliest_return(lib_copies):
+            return min((c['returnPlanDate'] for c in lib_copies if c['returnPlanDate']), default="9999")
+        ordered = sorted(by_library.items(), key=lambda item: (item[0] not in home, earliest_return(item[1])))
+    lines = [library_line(code, cs) for code, cs in ordered[:limit]]
+    if len(ordered) > limit:
+        more = "대출가능 " if available else ""
+        lines.append(f"… 외 {more}{len(ordered) - limit}곳")
+    return lines
+
+
 def format_book_detail(isbn, copies, home):
     """Text and buttons for one book's status at every library, 내 도서관 first."""
     if not copies:
-        return f"📭 ISBN {isbn}\n부천시 도서관에 없는 책이에요.\n\n🔗 {SEARCH_PAGE_URL}{isbn}", None
+        buttons = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🆕 부천 도서관에 들어오면 알림", callback_data=f"n:{isbn}")]])
+        return f"📭 ISBN {isbn}\n아직 부천시 도서관에 없는 책이에요.", buttons
 
     book = copies[0]
     header = [f"📖 {book['title']}"]
@@ -607,7 +652,7 @@ def register_watch(isbn):
     if copies is None:
         return "❌ 도서관 조회 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요."
     if not copies:
-        return "📭 부천시 도서관에 없는 책이라 알림을 걸 수 없어요."
+        return f"📭 아직 부천시 도서관에 없는 책이에요. 들어오면 알림을 받으려면 /new {isbn} 을 보내세요."
 
     title = display_title(copies[0]['title'])
     for row in sheet_manager.get_all_books():
@@ -672,12 +717,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             results.append(f"❓ {name}")
             continue
 
-        icon, detail = describe_holdings(home_first(holdings, home), with_library=codes is None or len(codes) > 1)
+        icon, _ = describe_holdings(holdings)
         line = f"{icon} {name}"
         if icon == "📭":
             line += f"\n    {scope or '부천 전체 도서관'}에 소장하지 않음"
-        elif detail != "대출가능":
-            line += f"\n    {detail}"
+        else:
+            line += "".join(f"\n    {status}" for status in library_status_lines(holdings, home))
         results.append(line)
 
     response = "📚 알림 걸어 둔 책 상태\n\n" + "\n".join(results)
@@ -783,8 +828,9 @@ async def cmd_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def build_subscription_list():
     subs = sheet_manager.get_subscriptions()
     if not subs:
-        return "🆕 신착 알림이 없습니다.\n사용법: /new 저자나 키워드 (예: /new 칼 세이건)", None
-    lines = [f"{i}. {s['Query']}" for i, s in enumerate(subs, 1)]
+        return ("🆕 신착 알림이 없습니다.\n사용법: /new 저자나 키워드 (예: /new 칼 세이건)\n"
+                "특정 책만: /new ISBN 또는 /new 제목 ISBN"), None
+    lines = [f"{i}. {'📘 ' if s['ISBN'] else ''}{s['Query']}" for i, s in enumerate(subs, 1)]
     buttons = [InlineKeyboardButton(f"🗑 {i}", callback_data=f"nd:{short_key(s['Query'])}")
                for i, s in enumerate(subs, 1)]
     text = (f"🆕 신착 알림 목록 ({NEW_ARRIVAL_HOURS}시간마다 확인)\n\n" + "\n".join(lines)
@@ -792,15 +838,61 @@ def build_subscription_list():
     return text, InlineKeyboardMarkup(chunk(buttons, 5))
 
 
+def subscribe_isbn(isbn, label=""):
+    """New-arrival alert for one exact book; returns the reply text (blocking).
+
+    If the book is already in Bucheon, alerts come when more libraries get it;
+    otherwise the first arrival anywhere is announced.
+    """
+    if any(s['ISBN'] == isbn for s in sheet_manager.get_subscriptions()):
+        return f"ℹ️ ISBN {isbn} 신착 알림은 이미 등록되어 있어요."
+    copies = find_isbn_copies(isbn)
+    if copies is None:
+        return "❌ 도서관 조회 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요."
+
+    label = label or (display_title(copies[0]['title']) if copies else "")
+    query = f"{label} ({isbn})" if label else f"ISBN {isbn}"
+    holding = {c['libCode'] for c in copies}
+    if not sheet_manager.save_subscription(query, holding, isbn):
+        return "❌ 시트에 저장하지 못했어요. 잠시 후 다시 시도해주세요."
+
+    if not copies:
+        return (f"🆕 '{query}' 신착 알림을 등록했어요.\n"
+                f"아직 부천시 도서관에 없는 책이에요. 어느 도서관에든 들어오면 알려 드릴게요 "
+                f"({NEW_ARRIVAL_HOURS}시간마다 확인).")
+    names = [short_name(code, cs[0]['libName']) for code, cs in group_by_library(copies, home_libraries()).items()]
+    names = ", ".join(names[:5]) + (f" 외 {len(names) - 5}곳" if len(names) > 5 else "")
+    return (f"🆕 '{query}' 신착 알림을 등록했어요.\n"
+            f"지금 {len(holding)}곳에 있어요: {names}\n"
+            "다른 도서관에 새로 들어오면 알려 드릴게요. 대출 가능 알림은 책 상세 화면의 🔔 버튼을 쓰세요.")
+
+
+def parse_new_args(args):
+    """'/new 제목 9791234567890' -> ('제목', '9791234567890'); no ISBN -> (text, '')."""
+    isbn, words = "", []
+    for word in args:
+        candidate = word.replace('-', '').upper()
+        if not isbn and re.fullmatch(ISBN_PATTERN, candidate):
+            isbn = candidate
+        else:
+            words.append(word)
+    return ' '.join(words).strip(), isbn
+
+
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/new: list new-arrival subscriptions; /new <author or keyword>: subscribe."""
-    query = ' '.join(context.args).strip()
-    if not query:
+    """/new: list subscriptions; /new <author or keyword>: subscribe;
+    /new [title] <ISBN>: subscribe to that exact book."""
+    query, isbn = parse_new_args(context.args)
+    if not query and not isbn:
         text, buttons = await asyncio.to_thread(build_subscription_list)
         await update.message.reply_text(text, reply_markup=buttons)
         return
 
-    logger.info(f"Command /new received: {query}")
+    logger.info(f"Command /new received: {query} {isbn}".strip())
+    if isbn:
+        status_msg = await update.message.reply_text(f"🔍 ISBN {isbn} 신착 알림 등록 중...")
+        await status_msg.edit_text(await asyncio.to_thread(subscribe_isbn, isbn, query))
+        return
     status_msg = await update.message.reply_text(f"🔍 '{query}' 신착 알림 등록 중...")
     subs = await asyncio.to_thread(sheet_manager.get_subscriptions)
     if any(s['Query'] == query for s in subs):
@@ -887,6 +979,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "w":    # 🔔 알림 받기
         await query.answer("알림 등록 중...")
         await query.message.reply_text(await asyncio.to_thread(register_watch, arg))
+
+    elif action == "n":    # 🆕 부천 도서관에 들어오면 알림 (book not in Bucheon yet)
+        await query.answer("신착 알림 등록 중...")
+        await query.message.reply_text(await asyncio.to_thread(subscribe_isbn, arg))
 
     elif action == "got":  # ✅ 빌렸어요 on an availability alert
         deleted = await asyncio.to_thread(sheet_manager.delete_by_key, arg)

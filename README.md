@@ -11,8 +11,9 @@ Loan status comes from the Bucheon library catalog (`alpasq.bcl.go.kr`), the sam
 - **Barcode photo**: send a photo of a book's barcode (e.g. in a bookstore) to see its status in Bucheon libraries.
 - **Per-library status**: 내 도서관 first, then every other library with 자료실 and 청구기호 for available copies, return dates and whether a hold (예약) is possible. When 내 도서관 has no copy available but another library can lend one, it suggests 상호대차.
 - **🔔 Alerts**: the 🔔 button (or `/a 제목`) watches **every Bucheon library** and sends an alert when the book becomes available somewhere, listing where to find it (내 도서관 first). Tap **✅ 빌렸어요** to remove it from the list, or **🔕 이번엔 패스** to be told again the next time it comes back.
-- **Watch list**: `/st` shows each book's status (return date, holds, ⚠️ overdue), `/l` lists them with 🗑 buttons, `/d 번호` removes one.
+- **Watch list**: `/st` shows each book's status per library (where to find it, or return dates, holds, ⚠️ overdue), `/l` lists them with 🗑 buttons, `/d 번호` removes one.
 - **New arrivals**: `/new 저자나 키워드` alerts you when a matching book arrives in any Bucheon library (checked every `NEW_ARRIVAL_HOURS`); `/new` alone lists them with 🗑 buttons.
+- **New arrivals of one exact book**: `/new ISBN` (or `/new 제목 ISBN`) follows that ISBN only, so same-titled books can't trigger it. It alerts when the book first arrives in Bucheon, then whenever another library gets it. A book not in Bucheon yet (e.g. a barcode photo taken in a bookstore) shows a 🆕 button that does the same.
 - **내 도서관**: `/home` chooses which libraries are shown first (default 별빛마루). It doesn't limit what alerts check.
 - **Quiet hours**: no checks or alerts during `QUIET_HOURS` (default 22–8 KST); the first check afterwards catches anything returned overnight.
 
@@ -29,7 +30,7 @@ Loan status comes from the Bucheon library catalog (`alpasq.bcl.go.kr`), the sam
     - **Status**: Written by the bot (`Y`/`N`, last seen availability). Added automatically if missing.
 4. **Share** the sheet with the `client_email` from your Google Service Account (see below) giving it **Editor** access.
 
-The bot also creates two tabs on first use: **Settings** (`home_libraries`) and **Subscriptions** (new-arrival queries and the ISBNs already seen).
+The bot also creates two tabs on first use: **Settings** (`home_libraries`) and **Subscriptions** (`Query`, `Seen`, `ISBN`: keyword subscriptions keep the ISBNs already announced, ISBN subscriptions the libraries already holding the book).
 
 ### 2. Environment Variables
 Set these in a `.env` file in the project folder (on a VM, copy it there as described in section 5).
