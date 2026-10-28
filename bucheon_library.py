@@ -1,12 +1,16 @@
 import html
 import logging
 import re
+from datetime import datetime, timedelta, timezone
 import requests
 
 logger = logging.getLogger(__name__)
 
 AVAILABLE = "대출가능"
 SEARCH_PAGE_URL = "https://alpasq.bcl.go.kr/search/keyword/"
+
+# Korea has no daylight saving time, so a fixed offset is exact (and needs no tzdata on Windows)
+KST = timezone(timedelta(hours=9))
 
 
 class BucheonLibraryClient:
@@ -51,7 +55,7 @@ class BucheonLibraryClient:
             'pubFormCode': 'MO',  # printed books only
             'page': '1',
             'display': str(display),
-            'article': order,  # LOANABLE (대출가능순) or SCORE (정확도)
+            'article': order,  # LOANABLE (대출가능순), SCORE (정확도) or RECENT (입고일순)
             'order': 'DESC',
             'manageCode': [self._manage_code(lib_code) if lib_code else "ALL"],
             'kidYn': '',
@@ -80,49 +84,86 @@ class BucheonLibraryClient:
             'workingStatus': book.get('workingStatus', ''),  # 비치중 / 대출중 / 예약중 / 상호대차중
             'returnPlanDate': book.get('returnPlanDate', ''),
             'reservationCount': int(book.get('reservationCount') or 0),
+            'shelf': book.get('shelfLocName', ''),             # 자료실, e.g. 종합자료실(2층)
+            'callNo': book.get('callNo', ''),                  # 청구기호
+            'inputDate': book.get('inputDate', ''),            # 입고일
+            'mutualLoan': book.get('isActiveMutualLoanYn') == 'Y',  # 상호대차 신청 가능
+            'reservable': book.get('isActiveResvYn') == 'Y',        # 예약 가능
         }
 
-    def find_holdings(self, lib_code, title, isbn=""):
-        """Returns the copies of a monitored book held by one library.
+    def find_holdings(self, lib_codes, title, isbn=""):
+        """Returns the copies of a monitored book held by the given libraries.
 
-        The ISBN is tried first. If that library has no copy with that ISBN
+        lib_codes: one library code, an iterable of codes, or None for every library.
+        The ISBN is tried first. If those libraries have no copy with that ISBN
         (often a different edition picked by an old title search), copies whose
         main title matches are used instead.
         """
-        lib_code = str(lib_code)
+        if isinstance(lib_codes, (str, int)):
+            lib_codes = [lib_codes]
+        wanted = None if lib_codes is None else {str(c) for c in lib_codes}
+        # A single library can be filtered by the catalog; otherwise fetch every library
+        only_lib = next(iter(wanted)) if wanted and len(wanted) == 1 else None
+        display = 100 if only_lib else 300
+
+        def in_scope(h):
+            return wanted is None or h['libCode'] in wanted
+
         if isbn:
-            holdings = self.search(isbn, lib_code)
+            holdings = self.search(isbn, only_lib, display=display)
             if holdings is None:
                 return None
-            holdings = [h for h in holdings if h['libCode'] == lib_code and h['isbn'] == isbn]
+            holdings = [h for h in holdings if in_scope(h) and h['isbn'] == isbn]
             if holdings:
                 return holdings
 
-        holdings = self.search(title, lib_code)
+        holdings = self.search(title, only_lib, display=display)
         if holdings is None:
             return None
-        wanted = main_title(title)
-        return [h for h in holdings if h['libCode'] == lib_code and main_title(h['title']) == wanted]
+        target = main_title(title)
+        return [h for h in holdings if in_scope(h) and main_title(h['title']) == target]
 
 
 def is_available(holdings):
     return any(h['loanStatus'] == AVAILABLE for h in holdings)
 
 
-def describe_holdings(holdings):
-    """Summarizes the copies at one library as (icon, detail text)."""
+def is_overdue(return_plan_date):
+    """True when a 'YYYY.MM.DD' return date is before today (KST)."""
+    try:
+        due = datetime.strptime(return_plan_date, "%Y.%m.%d").date()
+    except (TypeError, ValueError):
+        return False
+    return due < datetime.now(KST).date()
+
+
+def describe_holdings(holdings, with_library=False):
+    """Summarizes copies as (icon, detail text).
+
+    with_library adds which library the detail is about, for rows that watch
+    several libraries.
+    """
     if not holdings:
         return "📭", "미소장"
     if is_available(holdings):
-        return "✅", "대출가능"
+        if not with_library:
+            return "✅", "대출가능"
+        names = list(dict.fromkeys(h['libName'] for h in holdings if is_available([h])))
+        more = f" 외 {len(names) - 3}곳" if len(names) > 3 else ""
+        return "✅", f"대출가능 ({', '.join(names[:3])}{more})"
     dated = sorted((h for h in holdings if h['returnPlanDate']), key=lambda h: h['returnPlanDate'])
     first = dated[0] if dated else holdings[0]
     detail = first['workingStatus'] or "대출불가"
     if first['returnPlanDate']:
-        detail += f" · 반납예정 {first['returnPlanDate']}"
+        if is_overdue(first['returnPlanDate']):
+            detail += f" · ⚠️ 연체 중 (반납예정 {first['returnPlanDate']})"
+        else:
+            detail += f" · 반납예정 {first['returnPlanDate']}"
     reservations = sum(h['reservationCount'] for h in holdings)
     if reservations:
         detail += f" · 예약 {reservations}명"
+    if with_library:
+        detail += f" ({first['libName']})"
     return "❌", detail
 
 

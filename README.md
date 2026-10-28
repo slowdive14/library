@@ -6,6 +6,16 @@ Loan status comes from the Bucheon library catalog (`alpasq.bcl.go.kr`), the sam
 
 ⚠️ The catalog drops connections from non-Korean IPs, so the bot must run on a host in Korea. Overseas hosts such as Render (US/EU/Singapore) or GitHub Actions time out.
 
+## 💬 Using the Bot
+- **Search**: send a title, an author or an ISBN (or `/s ...`). Results are ranked by title match and show how many libraries have a copy available, with 내 도서관 marked. Tap a number for the per-library status.
+- **Barcode photo**: send a photo of a book's barcode (e.g. in a bookstore) to see its status in Bucheon libraries.
+- **Per-library status**: 내 도서관 first, then every other library with 자료실 and 청구기호 for available copies, return dates and whether a hold (예약) is possible. When 내 도서관 has no copy available but another library can lend one, it suggests 상호대차.
+- **🔔 Alerts**: the 🔔 button (or `/a 제목`) watches **every Bucheon library** and sends an alert when the book becomes available somewhere, listing where to find it (내 도서관 first). Tap **✅ 빌렸어요** to remove it from the list, or **🔕 이번엔 패스** to be told again the next time it comes back.
+- **Watch list**: `/st` shows each book's status (return date, holds, ⚠️ overdue), `/l` lists them with 🗑 buttons, `/d 번호` removes one.
+- **New arrivals**: `/new 저자나 키워드` alerts you when a matching book arrives in any Bucheon library (checked every `NEW_ARRIVAL_HOURS`); `/new` alone lists them with 🗑 buttons.
+- **내 도서관**: `/home` chooses which libraries are shown first (default 별빛마루). It doesn't limit what alerts check.
+- **Quiet hours**: no checks or alerts during `QUIET_HOURS` (default 22–8 KST); the first check afterwards catches anything returned overnight.
+
 ## 🚀 Setup Guide
 
 ### 1. Google Sheets Setup
@@ -13,11 +23,13 @@ Loan status comes from the Bucheon library catalog (`alpasq.bcl.go.kr`), the sam
 2. Rename the first sheet to `Sheet1` (default).
 3. Create the following headers in the first row:
     - **Title** (Required): Title of the book. Copies are matched by main title (subtitle, spaces and punctuation are ignored).
-    - **LibraryCode** (Required): The code of the library to check (e.g., `141652`).
+    - **LibraryCode** (Required): `ALL` (every library, what the bot adds), `HOME` (내 도서관), a library code (e.g. `141652`) or several codes separated by commas.
     - **LibraryName** (Optional): A human-readable name for the library.
-    - **ISBN** (Optional): Tried first; if that library has no copy with this ISBN, the title is used.
+    - **ISBN** (Optional): Tried first; if those libraries have no copy with this ISBN, the title is used.
     - **Status**: Written by the bot (`Y`/`N`, last seen availability). Added automatically if missing.
 4. **Share** the sheet with the `client_email` from your Google Service Account (see below) giving it **Editor** access.
+
+The bot also creates two tabs on first use: **Settings** (`home_libraries`) and **Subscriptions** (new-arrival queries and the ISBNs already seen).
 
 ### 2. Environment Variables
 Set these in a `.env` file in the project folder (on a VM, copy it there as described in section 5).
@@ -29,6 +41,8 @@ Set these in a `.env` file in the project folder (on a VM, copy it there as desc
 | `GOOGLE_SHEET_CREDENTIALS` | Service Account JSON | Google Cloud Console -> IAM & Admin -> Service Accounts -> Create Key (JSON). **Copy the entire JSON content.** |
 | `GOOGLE_SHEET_URL` | Full URL of your Sheet | Copy from browser address bar. |
 | `MONITOR_INTERVAL_MINUTES` | Optional, default `5` | Minutes between availability checks. |
+| `NEW_ARRIVAL_HOURS` | Optional, default `6` | Hours between new-arrival checks for `/new`. |
+| `QUIET_HOURS` | Optional, default `22-8` | Hours (KST, start-end) without checks or alerts. Empty turns it off. |
 | `USE_WEBHOOK` | Optional | `true` uses webhook mode on hosts that set `RENDER_EXTERNAL_URL`. Not needed on a PC or VM. |
 | `LOG_FILE` | Optional | Also write the log to this file (rotated at 5 MB). Defaults to `bot.log` when run with `pythonw`. |
 
@@ -108,8 +122,10 @@ Costs to watch:
 - After 12 months the VM is billed at pay-as-you-go rates.
 
 ## 📂 Project Structure
-- `bot.py`: Telegram commands and the periodic availability monitor.
-- `bucheon_library.py`: Client for the Bucheon library catalog (real-time loan status).
+- `bot.py`: Telegram commands, buttons, the availability monitor and new-arrival alerts.
+- `bucheon_library.py`: Client for the Bucheon library catalog (real-time loan status, title matching).
+- `sheets.py`: Google Sheet storage (watch list, Settings and Subscriptions tabs).
+- `isbn_barcode.py`: Reads the ISBN from a barcode photo (zxing-cpp).
 - `deploy/windows/`: Task Scheduler setup for a Windows PC.
 - `deploy/`: systemd unit and setup script for an Ubuntu VM in Korea.
 - `logic.md`: When a notification is sent.
