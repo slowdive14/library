@@ -43,23 +43,27 @@ Set these in a `.env` file (copied to the server in step 4).
     ```
     ⚠️ Stop the bot on the server first (`sudo systemctl stop library-bot`). Only one bot instance can poll Telegram at a time, and starting polling removes the webhook if one is set.
 
-### 4. Deployment: Oracle Cloud Always Free (Korea)
-The bot runs as a systemd service, polls Telegram and checks every monitored book every `MONITOR_INTERVAL_MINUTES` minutes. It needs no inbound ports besides SSH.
+### 4. Deployment: Azure VM in Korea Central
+The bot runs as a systemd service on an Ubuntu VM, polls Telegram and checks every monitored book every `MONITOR_INTERVAL_MINUTES` minutes. It needs no inbound ports besides SSH. Any Ubuntu VM with a Korean IP works the same way (e.g. Oracle Cloud with home region Chuncheon/Seoul; Tokyo, Osaka and Singapore are blocked).
 
-1. **Create an Oracle Cloud account** with home region **South Korea North (Chuncheon)** or **South Korea Central (Seoul)**. The home region can't be changed later, and Always Free resources exist only there.
-2. **Create a compute instance**
-    - Image: Canonical Ubuntu 24.04
-    - Shape: `VM.Standard.E2.1.Micro` (Always Free). If it is out of capacity, use `VM.Standard.A1.Flex` (Always Free, Arm) with 1 OCPU / 6 GB.
-    - Save the SSH private key and note the public IP.
+1. **Create an [Azure free account](https://azure.microsoft.com/pricing/purchase-options/azure-account)**. For 12 months it includes 750 hours/month each of `B1s`, `B2pts v2` and `B2ats v2` VMs, enough for one VM running all month.
+2. **Create a virtual machine** in the Azure portal
+    - Region: **(Asia Pacific) Korea Central**
+    - Image: Ubuntu Server 24.04 LTS - x64 Gen2
+    - Size: `Standard_B1s` or `Standard_B2ats_v2` (shown as free services eligible)
+    - Authentication: SSH public key, username `azureuser`; download the private key (`.pem`)
+    - Inbound ports: SSH (22) only
+    - Management tab: make sure **Auto-shutdown** is off
+    - After creation, note the public IP.
 3. **Clone the repo on the VM**
     ```bash
-    ssh -i <private-key> ubuntu@<public-ip>
+    ssh -i <private-key.pem> azureuser@<public-ip>
     git clone https://github.com/slowdive14/library.git ~/library
     exit
     ```
 4. **Copy your `.env`** from your PC (run in the project folder):
     ```bash
-    scp -i <private-key> .env ubuntu@<public-ip>:~/library/.env
+    scp -i <private-key.pem> .env azureuser@<public-ip>:~/library/.env
     ```
 5. **Stop any other running instance** of the bot (e.g. suspend the old Render service). Two instances polling the same token keep failing with `Conflict` errors.
 6. **Install and start the service** on the VM:
@@ -75,11 +79,14 @@ Day-to-day commands on the VM:
 | Restart | `sudo systemctl restart library-bot` |
 | Deploy new code | `cd ~/library && git pull && bash deploy/setup.sh` |
 
-Oracle may reclaim Always Free instances that stay idle for 7 days (CPU, network and, on Arm shapes, memory usage all below 20%), and this bot is mostly idle. Upgrading the account to Pay As You Go removes that rule while Always Free resources stay free. See [Always Free Resources](https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm).
+Costs to watch:
+- **Upgrade to pay-as-you-go within 30 days.** The free account's subscription is disabled when the 30-day credit ends; only after upgrading do the 12 months of free services continue. See [Avoid charges with your Azure free account](https://learn.microsoft.com/azure/cost-management-billing/manage/avoid-charges-free-account).
+- The VM hours are free, but other parts (OS disk, public IP, outbound traffic) may be billed separately. While the 30-day credit lasts, check **Cost Management → Cost analysis** to see what shows up, and add a small **budget alert** before upgrading.
+- After 12 months the VM is billed at pay-as-you-go rates.
 
 ## 📂 Project Structure
 - `bot.py`: Telegram commands and the periodic availability monitor.
 - `bucheon_library.py`: Client for the Bucheon library catalog (real-time loan status).
-- `deploy/`: systemd unit and setup script for the Oracle Cloud VM.
+- `deploy/`: systemd unit and setup script for an Ubuntu VM in Korea.
 - `logic.md`: When a notification is sent.
 - `requirements.txt`: Python dependencies.

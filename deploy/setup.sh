@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Installs (or updates) the bot as a systemd service on an Ubuntu VM in Korea,
-# e.g. Oracle Cloud Always Free in ap-chuncheon-1 / ap-seoul-1.
+# e.g. Azure Korea Central or Oracle Cloud Chuncheon/Seoul.
 # The library catalog blocks non-Korean IPs, so the VM must be in a Korean region.
 #
-# Usage (as the login user, e.g. ubuntu):
+# Usage (as the login user, e.g. azureuser):
 #   bash ~/library/deploy/setup.sh
 # Run it again after `git pull` to reinstall dependencies and restart the bot.
 set -euo pipefail
