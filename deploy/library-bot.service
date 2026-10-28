@@ -1,0 +1,16 @@
+[Unit]
+Description=Bucheon library Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# User and paths below are filled in by deploy/setup.sh
+User=__USER__
+WorkingDirectory=__APP_DIR__
+ExecStart=__APP_DIR__/.venv/bin/python bot.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
