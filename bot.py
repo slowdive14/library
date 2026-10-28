@@ -396,7 +396,7 @@ async def new_arrival_job(context: ContextTypes.DEFAULT_TYPE):
 BOT_COMMANDS = [
     BotCommand("s", "책 검색 (제목·저자·ISBN)"),
     BotCommand("st", "알림 걸어 둔 책 상태"),
-    BotCommand("l", "알림 목록 · 삭제"),
+    BotCommand("l", "알림 목록 (대출·신착) · 해제"),
     BotCommand("a", "제목으로 알림 추가"),
     BotCommand("new", "신착 알림 (저자·키워드·ISBN)"),
     BotCommand("home", "내 도서관 설정"),
@@ -422,10 +422,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 /s 책제목 - 검색 (번호를 누르면 도서관별 현황)
 /st - 알림 걸어 둔 책 상태
-/l - 알림 목록 (🗑 버튼으로 삭제)
+/l - 걸어 둔 알림 목록: 🔔 대출 알림 + 🆕 신착 알림 (🗑 버튼으로 해제)
 /a 책제목 - 제목으로 알림 추가
 /d 번호 또는 책제목 - 알림 삭제
-/new 저자나 키워드 - 신착 알림 (/new 만 쓰면 목록)
+/new 저자나 키워드 - 신착 알림
 /new ISBN (또는 /new 제목 ISBN) - 그 책만 정확히 신착 알림
 /home - 내 도서관 설정
 /h - 이 도움말
@@ -660,7 +660,7 @@ def register_watch(isbn):
             return f"ℹ️ 이미 알림을 걸어 둔 책이에요.\n📖 {title}"
     if not sheet_manager.add_book(title, ALL_LIBRARIES, "전체", isbn):
         return "❌ 시트에 저장하지 못했어요. 잠시 후 다시 시도해주세요."
-    return f"🔔 알림 등록 완료\n📖 {title}\n\n{watch_status_note(copies)}"
+    return f"🔔 알림 등록 완료\n📖 {title}\n\n{watch_status_note(copies)}\n\n걸어 둔 알림은 /l 에서 볼 수 있어요."
 
 
 def watch_status_note(holdings):
@@ -731,23 +731,54 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(message)
 
 
-def build_watch_list():
-    """Text and 🗑 buttons for /l (blocking)."""
+def describe_subscription(sub):
+    """'📘 코스모스 (978…)\n    부천 26곳 소장 · …' for the alert list."""
+    if sub['ISBN']:
+        held = len(sub['Seen'])
+        state = (f"이 책만 · 부천 {held}곳 소장, 다른 도서관에 들어오면 알림" if held
+                 else "이 책만 · 아직 부천에 없음, 들어오면 알림")
+        return f"📘 {sub['Query']}\n    {state}"
+    return f"🔎 {sub['Query']}\n    제목이나 저자가 일치하는 새 책 (지금 {len(sub['Seen'])}권 있음)"
+
+
+def build_alert_list():
+    """Text and 🗑 buttons for /l and /new: 🔔 availability alerts and 🆕 new-arrival alerts (blocking)."""
     books = sheet_manager.get_all_books()
-    if not books:
-        return "📭 알림을 걸어 둔 책이 없습니다.\n/s 로 검색해서 🔔 버튼으로 추가해 보세요.", None
-    lines, buttons = [], []
-    for i, row in enumerate(books, 1):
-        title = str(row.get('Title', '')).strip() or '제목 없음'
-        lines.append(f"{i}. {title} @ {library_label(row.get('LibraryCode', ''), row.get('LibraryName'))}")
-        buttons.append(InlineKeyboardButton(f"🗑 {i}", callback_data=f"del:{book_key(row)}"))
-    text = "📚 알림 목록\n\n" + "\n".join(lines) + "\n\n🗑 번호를 누르면 목록에서 뺍니다."
-    return text, InlineKeyboardMarkup(chunk(buttons, 5))
+    subs = sheet_manager.get_subscriptions()
+    if not books and not subs:
+        return ("📭 걸어 둔 알림이 없습니다.\n"
+                "🔔 대출 알림: /s 로 검색해서 🔔 버튼\n"
+                "🆕 신착 알림: /new 저자나 키워드, /new ISBN"), None
+
+    sections, rows = [], []
+    if books:
+        lines, buttons = [], []
+        for i, row in enumerate(books, 1):
+            title = str(row.get('Title', '')).strip() or '제목 없음'
+            lines.append(f"{i}. {title} @ {library_label(row.get('LibraryCode', ''), row.get('LibraryName'))}")
+            buttons.append(InlineKeyboardButton(f"🗑 {i}", callback_data=f"del:{book_key(row)}"))
+        sections.append(f"🔔 대출 알림 ({MONITOR_INTERVAL_MINUTES}분마다 확인)\n" + "\n".join(lines))
+        rows += chunk(buttons, 5)
+    else:
+        sections.append("🔔 대출 알림: 없음 (/s 로 검색해서 🔔 버튼으로 추가)")
+
+    if subs:
+        lines, buttons = [], []
+        for i, sub in enumerate(subs, 1):
+            lines.append(f"{i}. {describe_subscription(sub)}")
+            buttons.append(InlineKeyboardButton(f"🗑 🆕{i}", callback_data=f"nd:{short_key(sub['Query'])}"))
+        sections.append(f"🆕 신착 알림 ({NEW_ARRIVAL_HOURS}시간마다 확인)\n" + "\n".join(lines))
+        rows += chunk(buttons, 5)
+    else:
+        sections.append("🆕 신착 알림: 없음 (/new 저자나 키워드, /new ISBN)")
+
+    text = "📚 알림 목록\n\n" + "\n\n".join(sections) + "\n\n🗑 버튼을 누르면 그 알림을 해제합니다."
+    return text, InlineKeyboardMarkup(rows)
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """List all monitored books."""
-    text, buttons = await asyncio.to_thread(build_watch_list)
+    """List availability alerts and new-arrival alerts."""
+    text, buttons = await asyncio.to_thread(build_alert_list)
     await update.message.reply_text(text, reply_markup=buttons)
 
 
@@ -825,19 +856,6 @@ async def cmd_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text + "\n\n아래에서 눌러서 바꿀 수 있어요.", reply_markup=buttons)
 
 
-def build_subscription_list():
-    subs = sheet_manager.get_subscriptions()
-    if not subs:
-        return ("🆕 신착 알림이 없습니다.\n사용법: /new 저자나 키워드 (예: /new 칼 세이건)\n"
-                "특정 책만: /new ISBN 또는 /new 제목 ISBN"), None
-    lines = [f"{i}. {'📘 ' if s['ISBN'] else ''}{s['Query']}" for i, s in enumerate(subs, 1)]
-    buttons = [InlineKeyboardButton(f"🗑 {i}", callback_data=f"nd:{short_key(s['Query'])}")
-               for i, s in enumerate(subs, 1)]
-    text = (f"🆕 신착 알림 목록 ({NEW_ARRIVAL_HOURS}시간마다 확인)\n\n" + "\n".join(lines)
-            + "\n\n🗑 번호를 누르면 해제합니다.")
-    return text, InlineKeyboardMarkup(chunk(buttons, 5))
-
-
 def subscribe_isbn(isbn, label=""):
     """New-arrival alert for one exact book; returns the reply text (blocking).
 
@@ -859,12 +877,13 @@ def subscribe_isbn(isbn, label=""):
     if not copies:
         return (f"🆕 '{query}' 신착 알림을 등록했어요.\n"
                 f"아직 부천시 도서관에 없는 책이에요. 어느 도서관에든 들어오면 알려 드릴게요 "
-                f"({NEW_ARRIVAL_HOURS}시간마다 확인).")
+                f"({NEW_ARRIVAL_HOURS}시간마다 확인).\n\n걸어 둔 알림은 /l 에서 볼 수 있어요.")
     names = [short_name(code, cs[0]['libName']) for code, cs in group_by_library(copies, home_libraries()).items()]
     names = ", ".join(names[:5]) + (f" 외 {len(names) - 5}곳" if len(names) > 5 else "")
     return (f"🆕 '{query}' 신착 알림을 등록했어요.\n"
             f"지금 {len(holding)}곳에 있어요: {names}\n"
-            "다른 도서관에 새로 들어오면 알려 드릴게요. 대출 가능 알림은 책 상세 화면의 🔔 버튼을 쓰세요.")
+            "다른 도서관에 새로 들어오면 알려 드릴게요. 대출 가능 알림은 책 상세 화면의 🔔 버튼을 쓰세요.\n\n"
+            "걸어 둔 알림은 /l 에서 볼 수 있어요.")
 
 
 def parse_new_args(args):
@@ -884,7 +903,7 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /new [title] <ISBN>: subscribe to that exact book."""
     query, isbn = parse_new_args(context.args)
     if not query and not isbn:
-        text, buttons = await asyncio.to_thread(build_subscription_list)
+        text, buttons = await asyncio.to_thread(build_alert_list)
         await update.message.reply_text(text, reply_markup=buttons)
         return
 
@@ -914,6 +933,7 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "\n\n최근 입고:\n" + "\n".join(recent)
     else:
         text += "\n\n지금은 제목이나 저자가 일치하는 책이 없어요. 오타가 없는지 확인해 주세요."
+    text += "\n\n걸어 둔 알림은 /l 에서 볼 수 있어요."
     await status_msg.edit_text(text)
 
 
@@ -994,10 +1014,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         await edit_message(query, f"{query.message.text}\n\n🔕 이번엔 패스 · 대출됐다가 다시 반납되면 또 알려 드릴게요.")
 
-    elif action == "del":  # 🗑 in /l
+    elif action == "del":  # 🗑 on a 🔔 alert in /l
         deleted = await asyncio.to_thread(sheet_manager.delete_by_key, arg)
         await query.answer("삭제했어요" if deleted else "이미 삭제된 책이에요")
-        text, buttons = await asyncio.to_thread(build_watch_list)
+        text, buttons = await asyncio.to_thread(build_alert_list)
         await edit_message(query, text, buttons)
 
     elif action == "h":    # /home library toggles
@@ -1016,10 +1036,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, buttons = home_message(home)
         await edit_message(query, text + "\n\n아래에서 눌러서 바꿀 수 있어요.", buttons)
 
-    elif action == "nd":   # 🗑 in /new
+    elif action == "nd":   # 🗑 on a 🆕 alert in /l
         removed = await asyncio.to_thread(sheet_manager.delete_subscription, arg)
         await query.answer(f"'{removed}' 해제" if removed else "이미 해제됐어요")
-        text, buttons = await asyncio.to_thread(build_subscription_list)
+        text, buttons = await asyncio.to_thread(build_alert_list)
         await edit_message(query, text, buttons)
 
     else:
