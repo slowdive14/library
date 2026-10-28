@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-import requests
+import time
 import gspread
 import asyncio
 from oauth2client.service_account import ServiceAccountCredentials
@@ -10,6 +10,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 import http.server
 import threading
+from bucheon_library import BucheonLibraryClient, SEARCH_PAGE_URL, describe_holdings, is_available
 
 # Load environment variables
 load_dotenv()
@@ -19,11 +20,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Configuration
-LIBRARY_API_KEY = os.getenv("LIBRARY_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GOOGLE_SHEET_CREDENTIALS = os.getenv("GOOGLE_SHEET_CREDENTIALS")
 GOOGLE_SHEET_URL = os.getenv("GOOGLE_SHEET_URL")
+MONITOR_INTERVAL_MINUTES = int(os.getenv("MONITOR_INTERVAL_MINUTES", "5"))
 
 # Bucheon library codes (from API)
 BUCHEON_LIBRARIES = {
@@ -48,57 +49,12 @@ BUCHEON_LIBRARIES = {
 DEFAULT_LIB_CODE = "141652"
 DEFAULT_LIB_NAME = "별빛마루도서관"
 
-STATUS_FILE = "status.json"
+# Sheet column holding the last seen availability (Y/N). Render's disk is wiped
+# on every restart, so the state lives in the sheet instead of status.json.
+STATUS_HEADER = "Status"
 
-class LibraryClient:
-    """Interacts with the Library Information Naru API."""
-    BASE_URL = "http://data4library.kr/api"
-
-    def __init__(self, api_key):
-        self.api_key = api_key
-
-    def search_book(self, title):
-        """Searches for a book by title and returns info."""
-        # Try with original title first, then without spaces
-        for search_title in [title, title.replace(' ', '')]:
-            params = {
-                'authKey': self.api_key,
-                'title': search_title,
-                'format': 'json',
-                'pageSize': 5
-            }
-            try:
-                response = requests.get(f"{self.BASE_URL}/srchBooks", params=params, timeout=10)
-                response.raise_for_status()
-                data = response.json()
-                if data.get('response', {}).get('docs'):
-                    return data['response']['docs']
-            except Exception as e:
-                logger.error(f"Error searching for book '{search_title}': {e}")
-        return None
-
-    def check_availability(self, lib_code, isbn13):
-        """Checks if a book is available at a specific library."""
-        params = {
-            'authKey': self.api_key,
-            'libCode': lib_code,
-            'isbn13': isbn13,
-            'format': 'json'
-        }
-        try:
-            response = requests.get(f"{self.BASE_URL}/bookExist", params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            if 'response' in data and 'result' in data['response']:
-                result = data['response']['result']
-                return {
-                    'hasBook': result.get('hasBook'),
-                    'loanAvailable': result.get('loanAvailable')
-                }
-            return None
-        except Exception as e:
-            logger.error(f"Error checking availability: {e}")
-            return None
+# Warn on Telegram after this many monitor passes in a row where every lookup failed
+FAILED_PASSES_BEFORE_WARNING = 3
 
 
 class SheetManager:
@@ -175,26 +131,31 @@ class SheetManager:
             logger.error(f"Error deleting book: {e}")
             return False
 
+    def update_statuses(self, changes):
+        """Writes availability (Y/N) to the Status column.
 
-class StateManager:
-    """Manages the state of book availability."""
-    @staticmethod
-    def load_state():
-        if os.path.exists(STATUS_FILE):
-            try:
-                with open(STATUS_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception as e:
-                logger.error(f"Failed to load state: {e}")
-        return {}
-
-    @staticmethod
-    def save_state(state):
+        changes: list of (title, lib_code, status). Rows are matched by title and
+        library code at write time, so a /d during a check can't shift the writes.
+        """
+        if not self.sheet or not changes:
+            return
         try:
-            with open(STATUS_FILE, 'w', encoding='utf-8') as f:
-                json.dump(state, f, indent=4, ensure_ascii=False)
+            headers = self.sheet.row_values(1)
+            if STATUS_HEADER in headers:
+                col = headers.index(STATUS_HEADER) + 1
+            else:
+                col = len(headers) + 1
+                if col > self.sheet.col_count:
+                    self.sheet.add_cols(col - self.sheet.col_count)
+                self.sheet.update_cell(1, col, STATUS_HEADER)
+
+            wanted = {(title, lib_code): status for title, lib_code, status in changes}
+            for i, row in enumerate(self.sheet.get_all_records(), start=2):
+                key = (str(row.get('Title', '')).strip(), str(row.get('LibraryCode', '')).strip())
+                if key in wanted:
+                    self.sheet.update_cell(i, col, wanted[key])
         except Exception as e:
-            logger.error(f"Failed to save state: {e}")
+            logger.error(f"Error updating statuses: {e}")
 
 
 # Global clients (initialized in main)
@@ -212,6 +173,11 @@ def start_health_server():
             self.send_header("Content-type", "text/plain")
             self.end_headers()
             self.wfile.write(b"OK")
+
+        def do_HEAD(self):
+            # Some uptime pingers use HEAD instead of GET
+            self.send_response(200)
+            self.end_headers()
 
         def log_message(self, format, *args):
             return  # Disable logging for health checks
@@ -234,12 +200,81 @@ async def send_telegram_notification(application: Application, message: str):
         logger.error(f"Failed to send Telegram message: {e}")
 
 
+def run_monitor_pass():
+    """Checks every monitored book once (blocking; run in a worker thread).
 
+    Returns (notifications, changes, checked, failed). A book is announced when
+    it goes from N (or never seen) to Y, as described in logic.md.
+    """
+    notifications, changes = [], []
+    checked = failed = 0
+
+    for row in sheet_manager.get_all_books():
+        title = str(row.get('Title', '')).strip()
+        lib_code = str(row.get('LibraryCode', '')).strip()
+        if not title or not lib_code:
+            continue
+        lib_name = row.get('LibraryName') or BUCHEON_LIBRARIES.get(lib_code, lib_code)
+        isbn = str(row.get('ISBN', '')).strip()
+
+        checked += 1
+        holdings = lib_client.find_holdings(lib_code, title, isbn)
+        if holdings is None:
+            failed += 1
+            logger.warning(f"Could not check availability for '{title}' @ {lib_name}")
+            continue
+
+        saved_status = str(row.get(STATUS_HEADER, '')).strip()
+        status = 'Y' if is_available(holdings) else 'N'
+        logger.info(f"{title} @ {lib_name}: {status} (Last: {saved_status or 'N'})")
+
+        if (saved_status or 'N') == 'N' and status == 'Y':
+            available_isbn = next(h['isbn'] for h in holdings if is_available([h]))
+            notifications.append(
+                f"📚 대출 가능!\n\n📖 {title}\n📍 {lib_name}\n\n🔗 {SEARCH_PAGE_URL}{available_isbn}"
+            )
+        if saved_status != status:
+            changes.append((title, lib_code, status))
+
+        # Be nice to the library server
+        time.sleep(1)
+
+    return notifications, changes, checked, failed
+
+
+async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic job: notify books that became available and save the new statuses."""
+    if not sheet_manager or not sheet_manager.sheet:
+        logger.error("Monitor skipped: Google Sheet is not connected")
+        return
+
+    try:
+        notifications, changes, checked, failed = await asyncio.to_thread(run_monitor_pass)
+    except Exception as e:
+        logger.error(f"Monitor pass failed: {e}")
+        return
+
+    for message in notifications:
+        await send_telegram_notification(context.application, message)
+    if changes:
+        await asyncio.to_thread(sheet_manager.update_statuses, changes)
+
+    # Every lookup failing means the catalog is down or its API changed
+    if checked and failed == checked:
+        context.bot_data['failed_passes'] = context.bot_data.get('failed_passes', 0) + 1
+        if context.bot_data['failed_passes'] == FAILED_PASSES_BEFORE_WARNING:
+            await send_telegram_notification(
+                context.application,
+                f"⚠️ 도서관 조회가 {FAILED_PASSES_BEFORE_WARNING}회 연속 실패했습니다.\n"
+                "도서관 사이트가 점검 중이거나 검색 API가 바뀌었을 수 있습니다."
+            )
+    else:
+        context.bot_data['failed_passes'] = 0
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show help message."""
-    help_text = """📚 부천 도서관 봇 명령어
+    help_text = f"""📚 부천 도서관 봇 명령어
 
 /s 책제목 - 책 대출 가능 여부 조회
 /st - 모니터링 중인 책들 현재 상태
@@ -248,8 +283,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /d 책제목 - 모니터링에서 책 제거
 /h - 이 도움말 보기
 
-⏰ 자동 모니터링: 30분마다 체크
-⚠️ API 데이터는 전날 기준입니다 (실시간 아님)"""
+⏰ 자동 모니터링: {MONITOR_INTERVAL_MINUTES}분마다 체크
+📡 부천시립도서관 검색 시스템의 실시간 정보입니다"""
     await update.message.reply_text(help_text)
 
 
@@ -265,59 +300,67 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check if query is ISBN (13 digits)
     if query.replace('-', '').isdigit() and len(query.replace('-', '')) == 13:
         isbn = query.replace('-', '')
-        await check_book_by_isbn(update, isbn, f"ISBN {isbn}")
+        await check_book_by_isbn(update, isbn)
         return
 
     # Immediate feedback
     status_msg = await update.message.reply_text(f"🔍 '{query}' 검색 중...")
 
-    # Search for the book
-    try:
-        books = lib_client.search_book(query)
-    except Exception as e:
-        logger.error(f"Search error: {e}")
-        await status_msg.edit_text(f"❌ 검색 중 오류가 발생했습니다: {e}")
+    copies = await asyncio.to_thread(lib_client.search, query, None, "SCORE")
+    if copies is None:
+        await status_msg.edit_text("❌ 도서관 검색 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
         return
+
+    # The catalog returns one entry per copy; group them into distinct books
+    books = {}
+    for copy in copies:
+        if copy['isbn']:
+            books.setdefault(copy['isbn'], copy)
 
     if not books:
-        await status_msg.edit_text(f"❌ '{query}' 검색 결과가 없습니다.")
+        await status_msg.edit_text(f"❌ '{query}' 검색 결과가 없습니다. (부천시 도서관 미소장)")
         return
 
-    # If only 1 result or user wants first, check directly
+    # If only 1 result, check directly
     if len(books) == 1:
-        book = books[0]['doc']
-        isbn = book.get('isbn13', '')
-        await check_book_by_isbn(update, isbn, book.get('bookname', query), book.get('authors', ''))
+        await check_book_by_isbn(update, next(iter(books)))
         return
 
     # Show multiple results for user to choose
     response = f"📚 '{query}' 검색 결과 ({len(books)}건)\n\n"
-    for i, b in enumerate(books[:5], 1):
-        doc = b['doc']
-        title = doc.get('bookname', '제목 없음')[:40]
-        author = doc.get('authors', '')[:20]
-        isbn = doc.get('isbn13', '')
-        response += f"{i}. {title}\n   👤 {author}\n   /isbn{isbn}\n\n"
+    for i, book in enumerate(list(books.values())[:5], 1):
+        title = book['title'][:40]
+        author = book['author'][:20]
+        response += f"{i}. {title}\n   👤 {author}\n   /isbn{book['isbn']}\n\n"
 
     response += "👆 원하는 책의 /isbn... 클릭"
     await status_msg.edit_text(response)
 
 
-async def check_book_by_isbn(update: Update, isbn: str, title: str = "", author: str = ""):
-    """Check book availability by ISBN."""
-    import urllib.parse
+async def check_book_by_isbn(update: Update, isbn: str):
+    """Check book availability by ISBN at every Bucheon library."""
+    copies = await asyncio.to_thread(lib_client.search, isbn)
+    if copies is None:
+        await update.message.reply_text("❌ 도서관 조회 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
+        return
+    copies = [c for c in copies if c['isbn'] == isbn]
+
+    by_library = {}
+    for copy in copies:
+        by_library.setdefault(copy['libCode'], []).append(copy)
 
     available_libs = []
     unavailable_libs = []
+    for lib_code, lib_copies in by_library.items():
+        lib_name = BUCHEON_LIBRARIES.get(lib_code, lib_copies[0]['libName'])
+        icon, detail = describe_holdings(lib_copies)
+        if icon == "✅":
+            available_libs.append(lib_name)
+        else:
+            unavailable_libs.append(f"{lib_name} ({detail})")
 
-    for lib_code, lib_name in BUCHEON_LIBRARIES.items():
-        availability = lib_client.check_availability(lib_code, isbn)
-        if availability:
-            if availability['hasBook'] == 'Y':
-                if availability['loanAvailable'] == 'Y':
-                    available_libs.append(lib_name)
-                else:
-                    unavailable_libs.append(lib_name)
+    title = copies[0]['title'] if copies else f"ISBN {isbn}"
+    author = copies[0]['author'] if copies else ""
 
     response = f"📖 {title}\n"
     if author:
@@ -338,7 +381,7 @@ async def check_book_by_isbn(update: Update, isbn: str, title: str = "", author:
         response += "📭 부천시 도서관에 소장하지 않음"
 
     # Add library website link for verification (use ISBN for accuracy)
-    response += f"\n\n🔗 실제 확인: https://alpasq.bcl.go.kr/search/keyword/{isbn}"
+    response += f"\n\n🔗 실제 확인: {SEARCH_PAGE_URL}{isbn}"
 
     await update.message.reply_text(response)
 
@@ -350,7 +393,7 @@ async def cmd_isbn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text.startswith('/isbn'):
         isbn = text[5:].strip()
         if isbn and len(isbn) == 13 and isbn.isdigit():
-            await check_book_by_isbn(update, isbn, f"ISBN {isbn}")
+            await check_book_by_isbn(update, isbn)
         else:
             await update.message.reply_text("잘못된 ISBN입니다.")
 
@@ -368,36 +411,27 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     results = []
     for row in books:
-        title = row.get('Title')
+        title = str(row.get('Title', '')).strip()
         lib_code = str(row.get('LibraryCode', DEFAULT_LIB_CODE))
         lib_name = row.get('LibraryName', DEFAULT_LIB_NAME)
-        isbn = row.get('ISBN')
+        isbn = str(row.get('ISBN', '')).strip()
 
         if not title:
             continue
 
-        # Get ISBN if not provided
-        if not isbn:
-            search_result = lib_client.search_book(title)
-            if search_result:
-                isbn = search_result[0]['doc'].get('isbn13', '')
+        holdings = await asyncio.to_thread(lib_client.find_holdings, lib_code, title, isbn)
+        if holdings is None:
+            results.append(f"❓ {title} @ {lib_name}")
+            continue
 
-        if isbn:
-            availability = lib_client.check_availability(lib_code, isbn)
-            if availability:
-                if availability['hasBook'] == 'Y':
-                    status = "✅" if availability['loanAvailable'] == 'Y' else "❌"
-                else:
-                    status = "📭"
-            else:
-                status = "❓"
-        else:
-            status = "❓"
-
-        results.append(f"{status} {title} @ {lib_name}")
+        icon, detail = describe_holdings(holdings)
+        line = f"{icon} {title} @ {lib_name}"
+        if icon == "❌":
+            line += f"\n    {detail}"
+        results.append(line)
 
     response = "📚 **모니터링 상태**\n\n" + "\n".join(results)
-    response += "\n\n✅=대출가능 ❌=대출중 📭=미소장"
+    response += "\n\n✅=대출가능 ❌=대출불가 📭=미소장 ❓=조회실패"
     await update.message.reply_text(response)
 
 
@@ -429,17 +463,21 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     title = ' '.join(context.args)
     status_msg = await update.message.reply_text(f"📝 '{title}' 모니터링 추가 중...")
 
-    # Search for ISBN
     try:
-        books = lib_client.search_book(title)
-        isbn = ""
-        if books:
-            isbn = books[0]['doc'].get('isbn13', '')
-
-        if sheet_manager.add_book(title, isbn=isbn):
-            await status_msg.edit_text(f"✅ '{title}' 모니터링 목록에 추가했습니다.")
-        else:
+        # No ISBN is stored: the monitor matches copies by title, so it isn't
+        # tied to whichever edition a search happened to return first
+        if not await asyncio.to_thread(sheet_manager.add_book, title):
             await status_msg.edit_text(f"❌ 추가 실패. 브라우저에서 직접 시트에 추가하거나 나중에 다시 시도해주세요.")
+            return
+
+        note = ""
+        holdings = await asyncio.to_thread(lib_client.find_holdings, DEFAULT_LIB_CODE, title)
+        if holdings is not None:
+            icon, detail = describe_holdings(holdings)
+            note = f"\n\n현재 {DEFAULT_LIB_NAME}: {icon} {detail}"
+            if not holdings:
+                note += "\n⚠️ 도서관에 등록된 제목과 다르면 알림이 오지 않습니다. /s 로 정확한 제목을 확인해주세요."
+        await status_msg.edit_text(f"✅ '{title}' 모니터링 목록에 추가했습니다.{note}")
     except Exception as e:
         logger.error(f"Add error: {e}")
         await status_msg.edit_text(f"❌ 처리 중 오류가 발생했습니다: {e}")
@@ -476,15 +514,17 @@ def main():
     global lib_client, sheet_manager
     logger.info("Starting Telegram Bot...")
 
-    # Start health server in background for Render ONLY if using Polling
-    # If RENDER_EXTERNAL_URL is present, we'll use run_webhook which binds to the port itself
-    if (os.environ.get('RENDER') or os.environ.get('PORT')) and not os.environ.get('RENDER_EXTERNAL_URL'):
+    # Polling is the default so the health server can answer an external uptime
+    # pinger with 200 and keep Render's free instance (and the monitor job) awake.
+    # USE_WEBHOOK=true brings back webhook mode, which binds the port itself.
+    use_webhook = os.environ.get('USE_WEBHOOK', '').lower() == 'true'
+    if (os.environ.get('RENDER') or os.environ.get('PORT')) and not use_webhook:
         threading.Thread(target=start_health_server, daemon=True).start()
-        logger.info("Background health check server thread started (Polling mode fallback)")
+        logger.info("Background health check server thread started")
 
     # Initialize clients safely
     try:
-        lib_client = LibraryClient(LIBRARY_API_KEY)
+        lib_client = BucheonLibraryClient()
         sheet_manager = SheetManager()
     except Exception as e:
         logger.error(f"Critical error during initialization: {e}")
@@ -514,12 +554,19 @@ def main():
     # Handle plain text as book search (must be last)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
 
+    # Background availability monitor
+    if application.job_queue is None:
+        logger.error('JobQueue unavailable: install "python-telegram-bot[job-queue]" to enable monitoring')
+    else:
+        application.job_queue.run_repeating(monitor_job, interval=MONITOR_INTERVAL_MINUTES * 60, first=30)
+        logger.info(f"Availability monitor scheduled every {MONITOR_INTERVAL_MINUTES} minutes")
+
     # Run the bot
     render_url = os.environ.get('RENDER_EXTERNAL_URL')
     port = int(os.environ.get("PORT", 8443))
 
-    if render_url:
-        # Webhook mode for Render (to prevent spin-down)
+    if use_webhook and render_url:
+        # Webhook mode: Telegram messages wake Render up, but the monitor only runs while awake
         logger.info(f"Running in webhook mode on port {port}")
         logger.info(f"External URL: {render_url}")
         
@@ -534,7 +581,8 @@ def main():
             allowed_updates=Update.ALL_TYPES
         )
     else:
-        # Polling mode for local development
+        # Polling mode (Render default and local development).
+        # Starting polling deletes any webhook left over from webhook mode.
         logger.info("Running in polling mode")
         application.run_polling(allowed_updates=Update.ALL_TYPES)
 
