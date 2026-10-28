@@ -661,15 +661,22 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not title:
             continue
 
+        # Rows that don't watch every library (e.g. added by older versions) show their scope
+        all_libraries = lib_code.strip().upper() == ALL_LIBRARIES
+        scope = "" if all_libraries else await asyncio.to_thread(library_label, lib_code, row.get('LibraryName'))
+        name = f"{title} @ {scope}" if scope else title
+
         codes = await asyncio.to_thread(resolve_libraries, lib_code)
         holdings = await asyncio.to_thread(lib_client.find_holdings, codes, title, isbn)
         if holdings is None:
-            results.append(f"❓ {title}")
+            results.append(f"❓ {name}")
             continue
 
         icon, detail = describe_holdings(home_first(holdings, home), with_library=codes is None or len(codes) > 1)
-        line = f"{icon} {title}"
-        if detail not in ("대출가능", "미소장"):
+        line = f"{icon} {name}"
+        if icon == "📭":
+            line += f"\n    {scope or '부천 전체 도서관'}에 소장하지 않음"
+        elif detail != "대출가능":
             line += f"\n    {detail}"
         results.append(line)
 
