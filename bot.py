@@ -13,7 +13,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 import http.server
 import threading
-from bucheon_library import BucheonLibraryClient, SEARCH_PAGE_URL, describe_holdings, is_available
+from bucheon_library import BucheonLibraryClient, SEARCH_PAGE_URL, describe_holdings, is_available, match_tier
 
 # Load environment variables
 load_dotenv()
@@ -331,19 +331,22 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Immediate feedback
     status_msg = await update.message.reply_text(f"🔍 '{query}' 검색 중...")
 
-    copies = await asyncio.to_thread(lib_client.search, query, None, "SCORE", SEARCH_COPIES)
-    if copies is None:
+    # Title search finds the book itself; keyword search adds books by that author
+    title_copies, keyword_copies = await asyncio.gather(
+        asyncio.to_thread(lib_client.search, query, None, "SCORE", SEARCH_COPIES, "title"),
+        asyncio.to_thread(lib_client.search, query, None, "SCORE", SEARCH_COPIES),
+    )
+    if title_copies is None and keyword_copies is None:
         await status_msg.edit_text("❌ 도서관 검색 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
         return
 
-    # The catalog returns one entry per copy; group them into distinct books
-    books = {}
-    for copy in copies:
-        if copy['isbn']:
-            books.setdefault(copy['isbn'], []).append(copy)
-
+    books = rank_search_results(query, title_copies or [], keyword_copies or [])
     if not books:
-        await status_msg.edit_text(f"❌ '{query}' 검색 결과가 없습니다. (부천시 도서관 미소장)")
+        await status_msg.edit_text(
+            f"❌ '{query}' 검색 결과가 없습니다.\n"
+            "제목이나 저자가 일치하는 책이 부천시 도서관에 없어요. "
+            "띄어쓰기를 바꾸거나 제목 일부만 입력해 보세요."
+        )
         return
 
     # If only 1 result, check directly
@@ -370,6 +373,39 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await status_msg.edit_text(messages[0])
     for message in messages[1:]:
         await update.message.reply_text(message)
+
+
+def rank_search_results(query, title_copies, keyword_copies):
+    """Groups catalog copies into books (ISBN -> copies), best matches first.
+
+    Books from the title search are always kept. Keyword search also matches
+    subjects, series and subtitles, so books only it found are kept only when
+    match_tier accepts their title or author. Ties go to books held by more
+    libraries (usually the edition people mean), then to catalog order.
+    """
+    candidates = {}  # isbn -> [copies, found by title search, first-seen order]
+    for from_title, copies in ((True, title_copies), (False, keyword_copies)):
+        grouped = {}
+        for copy in copies:
+            if copy['isbn']:
+                grouped.setdefault(copy['isbn'], []).append(copy)
+        for isbn, book_copies in grouped.items():
+            if isbn not in candidates:
+                candidates[isbn] = [book_copies, from_title, len(candidates)]
+            elif len(book_copies) > len(candidates[isbn][0]):
+                candidates[isbn][0] = book_copies
+
+    ranked = []
+    for isbn, (book_copies, from_title, order) in candidates.items():
+        tier = match_tier(query, book_copies[0]['title'], book_copies[0]['author'])
+        if tier is None:
+            if not from_title:
+                continue
+            tier = 4
+        holding = len({c['libCode'] for c in book_copies})
+        ranked.append((tier, -holding, order, isbn))
+    ranked.sort()
+    return {isbn: candidates[isbn][0] for *_, isbn in ranked}
 
 
 def summarize_libraries(copies):

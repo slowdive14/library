@@ -41,10 +41,13 @@ class BucheonLibraryClient:
                 return "ALL"
         return self._manage_codes.get(str(lib_code), "ALL")
 
-    def search(self, keyword, lib_code=None, order="LOANABLE", display=100):
+    # Payload field per search scope: everything (title, subject, series...) or title only
+    SEARCH_FIELDS = {'keyword': 'searchKeyword', 'title': 'advTitle'}
+
+    def search(self, keyword, lib_code=None, order="LOANABLE", display=100, by="keyword"):
         """Searches the catalog and returns one dict per physical copy."""
         payload = {
-            'searchKeyword': keyword,
+            self.SEARCH_FIELDS[by]: keyword,
             'pubFormCode': 'MO',  # printed books only
             'page': '1',
             'display': str(display),
@@ -129,7 +132,35 @@ def main_title(title):
     title = _strip_tags(title)
     title = re.sub(r'^\s*[\(\[][^\)\]]*[\)\]]\s*', '', title)
     title = re.split(r'[:=]', title)[0]
-    return re.sub(r'[^0-9A-Za-z가-힣]', '', title).lower()
+    return _compact(title)
+
+
+def match_tier(query, title, author=""):
+    """Ranks how well a book matches a search query; lower is better, None is no match.
+
+    0 main title equals the query, 1 main title starts with it, 2 the whole title
+    (subtitle included) contains it, 3 the main title or the author contains every
+    word of it. Words found only in a subtitle (e.g. '학습' in '서바이벌 학습만화')
+    don't count, since that is what made keyword search return unrelated books.
+    """
+    q = _compact(query)
+    if not q:
+        return None
+    main = main_title(title)
+    if main == q:
+        return 0
+    if main.startswith(q):
+        return 1
+    if q in _compact(title):
+        return 2
+    words = [w for w in (_compact(w) for w in query.split()) if w]
+    if all(w in main for w in words) or all(w in _compact(author) for w in words):
+        return 3
+    return None
+
+
+def _compact(text):
+    return re.sub(r'[^0-9A-Za-z가-힣]', '', _strip_tags(text)).lower()
 
 
 def _strip_tags(text):
